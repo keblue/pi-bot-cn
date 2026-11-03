@@ -424,7 +424,7 @@ async function processInbound({ channel, chatId, senderId, text, receivedAt, mes
 	if (modeRe.settings.some((r) => r.test(t))) {
 		const mode = modeOf(ownerOf(chatId));
 		log("approval_mode_view", { chatId, owner: ownerOf(chatId), mode });
-		if (channel === "feishu") say(chatId, "mode_card", "", { modeCardId: `${startedAt}-${++modeCardSeq}`, mode });
+		if (channel === "feishu") say(chatId, "mode_card", `授权设置：${MODE_NAME[mode]}`, { modeCardId: `${startedAt}-${++modeCardSeq}`, mode });
 		else say(chatId, "reply", `现在是「${MODE_NAME[mode]}」。想换的话说「${mode === "always" ? "恢复每次询问" : "始终允许"}」就行，也可以在飞书里发「授权设置」用按钮切。`);
 		return { intent: "mode_view", mode };
 	}
@@ -534,7 +534,7 @@ feishu?.onCardAction(({ chatId, senderId, value }) => {
 		const owner = senderId ? `feishu:${senderId}` : ownerOf(chatId);
 		const from = setMode(owner, value.mode, "card", chatId);
 		// 设置卡原地更新：高亮新模式 + 一句话（不另发消息）
-		say(chatId, "mode_card", "", { modeCardId: value.card, mode: value.mode, note: modeSentence(value.mode, from) });
+		say(chatId, "mode_card", `授权设置：${MODE_NAME[value.mode]}`, { modeCardId: value.card, mode: value.mode, note: modeSentence(value.mode, from) });
 		return {};
 	}
 	if (value?.pibot === "approval") {

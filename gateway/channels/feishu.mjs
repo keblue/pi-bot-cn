@@ -11,6 +11,28 @@
 import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
+// 兜底：模型偶尔会模仿旧会话里的「—— AI之境」落款（人设早已不让加）。发到飞书前把结尾的署名去掉；
+// 流式输出到一半时，结尾刚冒出的「——」「—— AI」也先藏起来，后面接着有正文就会照常出现。
+const SIG_FULL = /\s*[—–-]{1,2}\s*AI\s*之境\s*[。.!！]?\s*$/;
+const SIG_PART = /\s*[—–]{1,2}\s*(A(I\s*(之)?)?)?\s*$/;
+export function stripSignatureText(text, final = true) {
+	if (typeof text !== "string") return text;
+	let t = text.replace(SIG_FULL, "");
+	if (!final) t = t.replace(SIG_PART, "");
+	return t;
+}
+function stripSignature(msg) {
+	if (!msg || typeof msg.text !== "string" || !["card", "stream", "ack", "attention", "text"].includes(msg.purpose ?? "text")) {
+		if (msg && typeof msg.note === "string") return { ...msg, note: stripSignatureText(msg.note) };
+		return msg;
+	}
+	// 只有回答卡是「全量快照」，才能先藏住结尾半截的「——」；stream 是增量追加，只去掉完整的署名
+	const text = stripSignatureText(msg.text, !(msg.purpose === "card" && msg.final === false));
+	const out = text === msg.text ? msg : { ...msg, text: text || (msg.purpose === "card" ? "…" : text) };
+	if (typeof out.note === "string") out.note = stripSignatureText(out.note);
+	return out;
+}
+
 const CARD_MAX = 9000; // 单卡正文上限（飞书卡片 ~30KB，留足余量）
 
 function card(text, { done, title }) {
@@ -440,6 +462,7 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 		status: () => ({ ...status, since: new Date(status.since).toISOString(), lastEventAt: status.lastEventAt && new Date(status.lastEventAt).toISOString() }),
 		sendTestCard,
 		async send(msg) {
+			msg = stripSignature(msg);
 			if (msg.purpose === "card" && msg.cardKey) return sendAnswer(msg);
 			if (msg.purpose === "approval" && msg.approvalId) return sendApproval(msg);
 			if (msg.purpose === "mode_card" && msg.modeCardId) return sendModeCard(msg);
