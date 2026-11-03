@@ -51,17 +51,19 @@ function answerCard(text, done, v) {
 // ---- 审批卡：一句自然的问话 + 命令 + 两个按钮；决定后原地改成一句话、去掉按钮 ----
 const DECIDED = {
 	approved: "👌 好，你同意了，我这就执行。",
+	approved_always: "👌 好，这就执行；以后一般的危险命令我直接做，不再问你（特别危险的还是会问）。",
 	denied: "好，这条先不做。",
 	timeout: "等了 10 分钟没等到你回复，这条我先不做了。",
 	cancelled: "好，不做了。",
 };
 function approvalCard(a, v) {
 	const mins = Math.round((a.timeoutMs ?? 600_000) / 60_000);
-	const ask = `接下来这条命令${a.why ? `**${a.why}**` : "有点危险"}，你同意我执行吗？`;
+	const ask = `接下来这条命令${a.why ? `**${a.why}**` : "有点危险"}，你同意我执行吗？${a.critical ? "\n<font color='grey'>（这类特别危险的命令，就算设了「始终允许」也会每次问你）</font>" : ""}`;
 	const code = "```bash\n" + String(a.command ?? "").slice(0, 1500) + "\n```";
 	const decided = a.state && a.state !== "pending";
-	const tail = decided ? DECIDED[a.state] ?? "好。" : `（${mins} 分钟内没回复我就先不做；直接回我「可以」「先别」也行）`;
-	const val = (ok) => ({ pibot: "approval", id: a.approvalId, ok });
+	// 拒绝后模型自己说的那句话（如果有）替换掉卡上的结果行
+	const tail = decided ? (a.note ? String(a.note).slice(0, 300) : DECIDED[a.state] ?? "好。") : `（${mins} 分钟内没回复我就先不做；直接回我「可以」「先别」也行）`;
+	const val = (ok, always) => (always ? { pibot: "approval", id: a.approvalId, ok, always: true } : { pibot: "approval", id: a.approvalId, ok });
 	if (v === 1) {
 		const elements = [
 			{ tag: "markdown", content: `${ask}\n${code}` },
@@ -73,11 +75,12 @@ function approvalCard(a, v) {
 				actions: [
 					{ tag: "button", text: { tag: "plain_text", content: "可以，执行" }, type: "primary", value: val(true) },
 					{ tag: "button", text: { tag: "plain_text", content: "先别" }, type: "default", value: val(false) },
+					...(a.critical ? [] : [{ tag: "button", text: { tag: "plain_text", content: "以后都允许" }, type: "default", value: val(true, true) }]),
 				],
 			});
 		return { config: { wide_screen_mode: true, update_multi: true }, elements };
 	}
-	const btn = (label, type, ok) => ({ tag: "button", text: { tag: "plain_text", content: label }, type, size: "medium", behaviors: [{ type: "callback", value: val(ok) }] });
+	const btn = (label, type, ok, always) => ({ tag: "button", text: { tag: "plain_text", content: label }, type, size: "medium", behaviors: [{ type: "callback", value: val(ok, always) }] });
 	const elements = [{ tag: "markdown", content: `${ask}\n${code}` }];
 	if (decided) elements.push({ tag: "markdown", content: tail });
 	else
@@ -89,9 +92,43 @@ function approvalCard(a, v) {
 				columns: [
 					{ tag: "column", width: "auto", elements: [btn("可以，执行", "primary_filled", true)] },
 					{ tag: "column", width: "auto", elements: [btn("先别", "default", false)] },
+					...(a.critical ? [] : [{ tag: "column", width: "auto", elements: [btn("以后都允许", "default", true, true)] }]),
 				],
 			},
 		);
+	return { schema: "2.0", config: { update_multi: true, width_mode: "fill" }, body: { elements } };
+}
+
+// ---- 授权设置卡：显示当前模式 + 「每次询问 / 始终允许」两个按钮；点了原地更新 ----
+function modeCard(m, v) {
+	const cur = m.mode === "always" ? "always" : "ask";
+	const head = `**危险命令授权**　现在是：**${cur === "always" ? "始终允许" : "每次询问"}**`;
+	const desc =
+		"· **每次询问**：执行危险命令（删文件、sudo、推送代码等）前先发卡片问你\n" +
+		"· **始终允许**：一般的危险命令直接做，不再问你\n" +
+		"<font color='grey'>删整个系统、格式化磁盘、关机重启、改我自己的密钥这类特别危险的命令，两种模式下都会先问你。</font>";
+	const val = (mode) => ({ pibot: "mode", mode, card: m.modeCardId });
+	const label = (mode) => (mode === cur ? "✓ " : "") + (mode === "always" ? "始终允许" : "每次询问");
+	if (v === 1) {
+		const elements = [{ tag: "markdown", content: `${head}\n${desc}` }];
+		if (m.note) elements.push({ tag: "markdown", content: m.note });
+		elements.push({
+			tag: "action",
+			actions: ["ask", "always"].map((mode) => ({ tag: "button", text: { tag: "plain_text", content: label(mode) }, type: mode === cur ? "primary" : "default", value: val(mode) })),
+		});
+		return { config: { wide_screen_mode: true, update_multi: true }, elements };
+	}
+	const elements = [{ tag: "markdown", content: `${head}\n${desc}` }];
+	if (m.note) elements.push({ tag: "markdown", content: m.note });
+	elements.push({
+		tag: "column_set",
+		flex_mode: "none",
+		columns: ["ask", "always"].map((mode) => ({
+			tag: "column",
+			width: "auto",
+			elements: [{ tag: "button", text: { tag: "plain_text", content: label(mode) }, type: mode === cur ? "primary_filled" : "default", size: "medium", behaviors: [{ type: "callback", value: val(mode) }] }],
+		})),
+	});
 	return { schema: "2.0", config: { update_multi: true, width_mode: "fill" }, body: { elements } };
 }
 
@@ -290,21 +327,7 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 	async function sendAnswer(msg) {
 		const key = msg.cardKey;
 		let st = cards[key] ?? { messageId: null, offset: 0 };
-		if (!msg.text.trim()) {
-			// 一个字没说就结束了：撤回「…」占位卡
-			if (msg.final && st.messageId) {
-				const t0 = Date.now();
-				try {
-					ok(await client.im.v1.message.delete({ path: { message_id: st.messageId } }), "delete_card");
-				} catch (e) {
-					throw new Error("delete_card " + errStr(e));
-				}
-				log("feishu_card_delete", { apiMs: Date.now() - t0 });
-				delete cards[key];
-				saveCards();
-			}
-			return;
-		}
+		if (!msg.text.trim()) return; // 从不撤回消息（撤回会在飞书里留下灰色的「撤回了一条消息」）
 		let rest = msg.text.slice(st.offset);
 		while (rest.length > CARD_MAX) {
 			// 太长：当前卡写满、收尾，剩下的进下一张
@@ -335,6 +358,16 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 			cards[key] = { messageId: id, offset: 0 };
 			saveCards();
 		} else await patchCard(st.messageId, (v) => approvalCard(msg, v), "approval", { state: msg.state });
+	}
+
+	async function sendModeCard(msg) {
+		const key = "mode:" + msg.modeCardId;
+		const st = cards[key];
+		if (!st?.messageId) {
+			const id = await createCard(msg.chatId, (v) => modeCard(msg, v), "mode");
+			cards[key] = { messageId: id, offset: 0 };
+			saveCards();
+		} else await patchCard(st.messageId, (v) => modeCard(msg, v), "mode", { mode: msg.mode });
 	}
 
 	// 测试卡：直接按 open_id 发给主人（scripts/feishu-test-card.mjs 也可单独跑）
@@ -409,6 +442,7 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 		async send(msg) {
 			if (msg.purpose === "card" && msg.cardKey) return sendAnswer(msg);
 			if (msg.purpose === "approval" && msg.approvalId) return sendApproval(msg);
+			if (msg.purpose === "mode_card" && msg.modeCardId) return sendModeCard(msg);
 			if (msg.purpose === "stream" && msg.streamKey) return sendStream(msg);
 			return sendText(msg);
 		},

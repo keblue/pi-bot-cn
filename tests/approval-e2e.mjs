@@ -1,6 +1,6 @@
 // 审批流程端到端测试（本地通道）：可以 / 先别 / 审批中喊停 / 超时
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-const H = process.env.HOME, D = `${H}/pi-bot-cn-data`, BASE = "http://127.0.0.1:8787";
+const H = process.env.HOME, D = process.env.PIBOT_DATA_DIR || `${H}/pi-bot-cn-data`, BASE = `http://127.0.0.1:${process.env.PIBOT_LOCAL_PORT || 8787}`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lines = (f) => (existsSync(f) ? readFileSync(f, "utf8").trim().split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return {}; } }) : []);
 const gw = () => lines(`${D}/logs/gateway.jsonl`);
@@ -22,6 +22,6 @@ if (req) {
 	await sleep(1500);
 }
 out.dirStillExists = existsSync(dir);
-out.botSaid = lines(`${D}/channel-local/${chat}.jsonl`).map((m) => `[${m.purpose ?? ""}] ${String(m.text ?? "").slice(0, 160)}`);
+out.botSaid = lines(`${D}/channel-local/${chat}.jsonl`).map((m) => `[${m.purpose ?? ""}${m.state ? ":" + m.state : ""}${m.note ? " note" : ""}${m.final ? " final" : ""}] ${String(m.note ?? m.text ?? "").slice(0, 160)}`);
 out.interrupts = lines(`${D}/logs/interrupts.jsonl`).filter((e) => e.chatId === chat || (e.ms ?? 0) > t0).map((e) => e.event ?? e.kind).slice(-8);
 console.log(JSON.stringify(out, null, 1));

@@ -12,7 +12,8 @@
  *    「[被用户打断] …新指令…」，模型拿到后立刻按新指令继续。
  * 3. 危险命令审批：执行前用 ctx.ui.confirm 发一个 RPC 对话框（title=pibot-approval），
  *    网关把它变成飞书「可以 / 先别」卡片；超时 = 不做；审批期间喊停/插话同样能立刻打断。
- *    规则在 config/interrupt-policy.json 的 approval 段。
+ *    规则在 config/interrupt-policy.json 的 approval 段。主人可选「始终允许」：普通危险命令由网关直接放行，
+ *    但 alwaysAskRules（删整个系统、格式化磁盘、关机、改我自己的密钥…）带 critical:true，任何模式都问。
  * 4. 安全收尾：每次打断都写一行 interrupts.jsonl（命令、已运行时长、杀进程耗时、
  *    是否疑似破坏性），并在 tool 结果里提醒模型「可能半完成，先检查再继续」。
  */
@@ -33,9 +34,12 @@ type UserInterrupt = { kind: "user-interrupt"; message: string; requestedAt: num
 const DESTRUCTIVE =
 	/\b(rm|mv|dd|mkfs|truncate|shred|chmod|chown|git\s+(push|reset|clean|checkout|rebase)|apt(-get)?|npm\s+(publish|install|i)|pip\s+install|systemctl|kill|curl\s+[^|]*-X\s*(POST|PUT|DELETE|PATCH))\b|>\s*[^&|]/;
 
-type Approval = { enabled: boolean; timeoutMs: number; rules: { re: RegExp; why: string }[]; protectedPaths: RegExp[] };
+type Rule = { re: RegExp; why: string };
+// rules：普通危险命令（「每次询问」模式下问；「始终允许」模式下网关直接放行）
+// critical：灾难级命令（任何模式都问）——请求里带 critical:true，网关据此决定
+type Approval = { enabled: boolean; timeoutMs: number; rules: Rule[]; critical: Rule[]; protectedPaths: RegExp[] };
 function loadApproval(): Approval {
-	const off: Approval = { enabled: false, timeoutMs: 600_000, rules: [], protectedPaths: [] };
+	const off: Approval = { enabled: false, timeoutMs: 600_000, rules: [], critical: [], protectedPaths: [] };
 	try {
 		const file = process.env.PIBOT_INTERRUPT_POLICY;
 		if (!file) return off;
@@ -44,6 +48,7 @@ function loadApproval(): Approval {
 			enabled: a.enabled !== false,
 			timeoutMs: (a.timeoutMinutes ?? 10) * 60_000,
 			rules: (a.rules ?? []).map((r: any) => ({ re: new RegExp(r.re, "i"), why: String(r.why) })),
+			critical: (a.alwaysAskRules ?? []).map((r: any) => ({ re: new RegExp(r.re, "i"), why: String(r.why) })),
 			protectedPaths: (a.protectedPathPatterns ?? []).map((x: string) => new RegExp(x, "i")),
 		};
 	} catch {
@@ -84,7 +89,7 @@ export default function (pi: ExtensionAPI) {
 		content: [
 			{
 				type: "text",
-				text: `[没有得到同意] ${what} 没有执行（对方拒绝了，或者一直没回复）。不要换一种写法绕过，不要再次申请同一操作，也不要把命令贴出来让对方自己去跑。用一句自然的中文（用「你」称呼对方，别说「主人」「超时」「点了按钮」这类系统话）告诉对方这一步没做，然后继续不需要它的部分，或问对方想怎么办。`,
+				text: `[没有得到同意] ${what} 没有执行（对方拒绝了，或者一直没回复）。不要换一种写法绕过，不要再次申请同一操作，也不要把命令贴出来让对方自己去跑。这一步的结果已经显示在审批卡上了，所以：要么什么都不说，要么只说**一句很短的话**（20 个字以内，用「你」称呼对方，别重复命令、别解释原因、别说「主人」「超时」「点了按钮」这类系统话）；如果任务还有不需要这一步的部分，就安静地继续做。`,
 			},
 		],
 		details: { denied: true },
@@ -96,7 +101,7 @@ export default function (pi: ExtensionAPI) {
 		if (!approval.enabled || (event.toolName !== "write" && event.toolName !== "edit")) return;
 		const path = String(event.input?.path ?? event.input?.file_path ?? "");
 		if (!approval.protectedPaths.some((r) => r.test(path))) return;
-		const ok = await ask(ctx, { tool: event.toolName, command: `${event.toolName} ${path}`, why: "会改动密钥或配置文件" }, ctx?.signal);
+		const ok = await ask(ctx, { tool: event.toolName, command: `${event.toolName} ${path}`, why: "会改动密钥或配置文件", critical: true }, ctx?.signal);
 		if (!ok) return { block: true, reason: `没有得到同意，${path} 没有改动。不要绕过，用一句自然的中文（用「你」称呼对方）说明这一步没做。` };
 	});
 
@@ -112,9 +117,10 @@ export default function (pi: ExtensionAPI) {
 			const entry: Active = { ac, command: String(params.command ?? ""), startedAt: Date.now() };
 			active.set(toolCallId, entry);
 			try {
-				const hit = approval.enabled ? approval.rules.find((r) => r.re.test(entry.command)) : undefined;
+				const crit = approval.enabled ? approval.critical.find((r) => r.re.test(entry.command)) : undefined;
+				const hit = crit ?? (approval.enabled ? approval.rules.find((r) => r.re.test(entry.command)) : undefined);
 				if (hit) {
-					const ok = await ask(ctx, { tool: "bash", command: entry.command.slice(0, 600), why: hit.why }, ac.signal);
+					const ok = await ask(ctx, { tool: "bash", command: entry.command.slice(0, 600), why: hit.why, critical: !!crit }, ac.signal);
 					if (ac.signal.aborted) throw new Error("aborted while waiting for approval");
 					if (!ok) return denied(`命令 \`${entry.command.slice(0, 200)}\``) as any;
 				}

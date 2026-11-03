@@ -33,6 +33,19 @@
     "_comment": "危险命令执行前先问主人（飞书里是一张「可以/先别」卡片；本地通道是一句话）。超时=不做。审批期间说「停/取消」也立即生效。",
     "enabled": true,
     "timeoutMinutes": 10,
+    "_modeComment": "授权模式：ask=每次询问（默认），always=始终允许（普通危险命令直接执行）。每个主人单独保存在 数据目录/approval-modes.json，重启不丢；没设置过时用环境变量 PI_APPROVAL_MODE。alwaysAskRules 里的灾难级命令在任何模式下都要问。",
+    "alwaysPatterns": [
+      "^(以后|之后|往后)?(都|就)?(不用|不必|别|不要)(再)?问(我)?(了)?(吧)?[!！。.~～ ]*$",
+      "^(始终|总是|一直|以后都|全部|都)(允许|同意|放行)(吧)?[!！。.~～ ]*$"
+    ],
+    "askPatterns": [
+      "^(恢复|改回|还是|改成|切回)?(每次|每一次)(都)?(询问|问(我|一下)?)(吧)?[!！。.~～ ]*$",
+      "^(恢复|改回)(询问|审批)(吧)?[!！。.~～ ]*$",
+      "^(以后|之后)?(还是)?(要|得)?先问(我|一下)?(再(做|执行))?(吧)?[!！。.~～ ]*$"
+    ],
+    "settingsPatterns": [
+      "^(授权|审批|权限)(设置|模式)[?？!！。.~～ ]*$"
+    ],
     "approvePatterns": [
       "^(可以|允许|同意|批准|行|好|好的|执行|执行吧|没问题|ok|okay|yes|y)[!！。.~～ ]*$"
     ],
@@ -83,6 +96,49 @@
       "pi-bot-cn/env",
       "\\.pem$",
       "id_(rsa|ed25519)"
-    ]
+    ],
+    "alwaysAskRules": [
+      {
+        "re": "\\brm\\s+(-\\S+\\s+)*-[a-zA-Z]*[rR][a-zA-Z]*\\s+(-\\S+\\s+)*[\"']?(/|~|\\$HOME|\\$\\{HOME\\}|/(etc|usr|bin|sbin|boot|lib|lib64|var|home|root|opt|srv|dev|proc|sys))/?\\*?[\"']?(\\s|;|&|\\||$)",
+        "why": "会删掉整个系统或整个主目录"
+      },
+      {
+        "re": "--no-preserve-root",
+        "why": "会删掉整个系统"
+      },
+      {
+        "re": "\\b(mkfs(\\.\\w+)?|wipefs|fdisk|sfdisk|parted|mkswap)\\b",
+        "why": "会格式化或改动磁盘分区"
+      },
+      {
+        "re": "\\bdd\\b.*\\bof=/dev/(sd|hd|vd|xvd|nvme|mmcblk|disk|mapper)",
+        "why": "会直接覆盖整块磁盘"
+      },
+      {
+        "re": ">\\s*/dev/(sd|hd|vd|xvd|nvme|mmcblk)",
+        "why": "会直接覆盖整块磁盘"
+      },
+      {
+        "re": "\\b(shutdown|reboot|poweroff|halt)\\b|\\binit\\s+[06]\\b|\\bsystemctl\\s+(poweroff|reboot|halt|kexec)\\b",
+        "why": "会关机或重启服务器"
+      },
+      {
+        "re": "\\bsystemctl\\s+(stop|disable|mask|kill)\\s+(\\S+\\s+)*pi-bot-cn",
+        "why": "会把我自己停掉"
+      },
+      {
+        "re": "(\\.config/pi-bot-cn|pi-bot-cn/env|(^|[\\s/'\"])\\.env\\b|/\\.ssh/|authorized_keys|id_(rsa|ed25519|ecdsa)|\\.pem\\b)",
+        "why": "会碰到我自己的密钥或登录配置"
+      },
+      {
+        "re": ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\}\\s*;\\s*:",
+        "why": "会把服务器拖垮（fork 炸弹）"
+      },
+      {
+        "re": "\\b(chmod|chown)\\s+(-\\S+\\s+)*-R\\s+\\S+\\s+/(\\s|$)",
+        "why": "会改掉整个系统的权限"
+      }
+    ],
+    "_alwaysAskComment": "灾难级命令：就算主人设了「始终允许」也每次都问（也不显示「以后都允许」按钮）。write/edit 改 .env、.ssh、密钥文件同样属于这一类。"
   }
 }

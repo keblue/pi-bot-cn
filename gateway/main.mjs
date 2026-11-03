@@ -99,26 +99,35 @@ function flushStream(chatId, { final = false } = {}) {
 const turnHasText = new Map();
 
 // ---- 飞书回答卡：一次运行（agent_start→agent_settled）一张卡，只放模型说的话，原地 patch ----
-// 运行开始就有卡（带「停止」按钮）：1.2s 内有文字就直接带文字发，否则先发「…」占位；
-// 结束时去掉按钮；一个字都没说就结束（比如刚开始就被喊停）→ 撤回占位卡，保持安静。
-// 主人插话改道后另起一张，让新回答出现在插话下面，像正常聊天。
-const answer = new Map(); // chatId -> {key, text, timer, sentLen, needSep}
+// 卡片什么时候出现：模型一开口就带文字发；或者一个工具跑了 2 秒还没说话 → 发「…」（为了让「停止」按钮可点）。
+// 结束时只去掉按钮，**从不撤回**（撤回会留下「撤回了一条消息」的灰条）。被喊停时卡里留模型已经说的话；
+// 一个字没说过的「…」卡就保持「…」、去掉按钮——不写任何网关文字。
+// 主人插话（补充 / 改成…）时不另起卡：同一张卡继续长成最终回答。
+// 审批被拒/超时后，模型那一句话直接写进审批卡（替换卡上的结果行），不再单独发一条。
+const answer = new Map(); // chatId -> {key, text, timer, sentLen, needSep, merge}
+const mergeNext = new Map(); // chatId -> 刚被拒绝的审批（模型的下一句话并进这张卡）
 let answerSeg = 0;
 function answerFor(chatId) {
 	let a = answer.get(chatId);
-	if (!a) answer.set(chatId, (a = { key: `${chatId}:${chats[chatId]?.sessionId}:${startedAt}:${++answerSeg}`, text: "", sentLen: 0, timer: null, needSep: false, placeholder: null }));
+	if (!a) {
+		answer.set(chatId, (a = { key: `${chatId}:${chats[chatId]?.sessionId}:${startedAt}:${++answerSeg}`, text: "", sentLen: 0, timer: null, needSep: false, placeholder: null, merge: mergeNext.get(chatId) }));
+		mergeNext.delete(chatId);
+	}
 	return a;
 }
+// 工具开跑：2 秒后还没说话、工具也还没结束 → 发「…」卡，好让「停止」按钮可点
 function answerOpen(chatId) {
 	if (!isQuiet(chatId)) return;
 	const a = answerFor(chatId);
-	if (a.sentLen || a.placeholder) return;
+	if (a.sentLen || a.placeholder || a.merge) return;
 	a.placeholder = setTimeout(() => {
-		if (answer.get(chatId) !== a || a.sentLen || a.text.trim()) return;
+		a.placeholder = null;
+		if (answer.get(chatId) !== a || a.sentLen || a.text.trim() || !toolRunning.get(chatId)) return;
 		say(chatId, "card", "…", { cardKey: a.key, final: false, supersedeKey: a.key });
 		a.sentLen = -1; // 占位卡已发
-	}, 1200);
+	}, 2000);
 }
+const toolRunning = new Map(); // chatId -> 正在跑的工具数
 function answerAppend(chatId, delta) {
 	const a = answerFor(chatId);
 	if (a.needSep && a.text.trim()) a.text += "\n\n";
@@ -132,10 +141,17 @@ function answerFlush(chatId, { final = false } = {}) {
 	clearTimeout(a.timer);
 	a.timer = null;
 	const text = a.text.trim();
-	if (text && (text.length !== a.sentLen || final)) {
+	if (a.merge) {
+		// 审批被拒后的那句话：并进审批卡
+		if (text && text.length !== a.sentLen) {
+			const m = a.merge;
+			say(chatId, "approval", m.command, { approvalId: m.id, command: m.command, why: m.why, timeoutMs: m.timeoutMs, state: m.state, note: text, supersedeKey: `appr-note:${m.id}` });
+			a.sentLen = text.length;
+		}
+	} else if (text && (text.length !== a.sentLen || final)) {
 		say(chatId, "card", text, { cardKey: a.key, final, supersedeKey: a.key });
 		a.sentLen = text.length;
-	} else if (!text && final && a.sentLen === -1) say(chatId, "card", "", { cardKey: a.key, final: true, supersedeKey: a.key }); // 撤回占位卡
+	} else if (!text && final && a.sentLen === -1) say(chatId, "card", "…", { cardKey: a.key, final: true, supersedeKey: a.key }); // 「…」卡去掉按钮，不撤回
 	if (final) clearTimeout(a.placeholder), answer.delete(chatId);
 }
 
@@ -186,13 +202,14 @@ function onEvent(chatId, s, ev) {
 	const mark = marks.get(chatId);
 	switch (ev.type) {
 		case "agent_start":
-			answerOpen(chatId);
 			chats[chatId].running = true;
 			saveChats();
 			break;
 		case "agent_settled":
 			flushStream(chatId);
 			answerFlush(chatId, { final: true });
+			mergeNext.delete(chatId);
+			toolRunning.delete(chatId);
 			chats[chatId].running = false;
 			saveChats();
 			log("agent_settled", { chatId, aborted: ev.aborted, sinceMarkMs: mark ? Date.now() - mark.t0 : undefined });
@@ -200,11 +217,16 @@ function onEvent(chatId, s, ev) {
 		case "tool_execution_start":
 			flushStream(chatId);
 			log("tool_start", { chatId, tool: ev.toolName, cmd: ev.toolName === "bash" ? String(ev.args?.command).slice(0, 200) : undefined });
+			toolRunning.set(chatId, (toolRunning.get(chatId) ?? 0) + 1);
+			mergeNext.delete(chatId);
+			if (answer.get(chatId)?.merge) answerFlush(chatId, { final: true }); // 被拒后模型接着干别的：之后的话另起回答卡
 			if (answer.has(chatId)) answerFlush(chatId); // 工具开跑前把已有文字推出去
+			answerOpen(chatId);
 			if (policy.showToolProgress && ev.toolName === "bash")
 				say(chatId, "progress", `🔧 正在执行：${String(ev.args?.command ?? "").split("\n")[0].slice(0, 120)}`);
 			break;
 		case "tool_execution_end": {
+			toolRunning.set(chatId, Math.max(0, (toolRunning.get(chatId) ?? 1) - 1));
 			const text = ev.result?.content?.map((c) => c.text ?? "").join("") ?? "";
 			const interrupted = /\[被用户打断\]/.test(text) || /Command aborted/.test(text);
 			log("tool_end", {
@@ -271,10 +293,20 @@ function onApprovalRequest(chatId, s, rec) {
 	try {
 		req = JSON.parse(rec.message ?? "{}");
 	} catch {}
-	const a = { id: rec.id, chatId, session: s, command: req.command ?? "", why: req.why ?? "", timeoutMs: req.timeoutMs ?? approvalTimeoutMs, createdAt: Date.now() };
+	const owner = ownerOf(chatId);
+	if (!req.critical && modeOf(owner) === "always") {
+		// 始终允许：普通危险命令直接放行，不发卡片
+		try {
+			s.write({ type: "extension_ui_response", id: rec.id, confirmed: true });
+		} catch {}
+		log("approval_auto", { chatId, owner, id: rec.id, why: req.why, cmd: String(req.command ?? "").slice(0, 200) });
+		if (toolRunning.get(chatId)) answerOpen(chatId);
+		return;
+	}
+	const a = { id: rec.id, chatId, session: s, command: req.command ?? "", why: req.why ?? "", critical: !!req.critical, timeoutMs: req.timeoutMs ?? approvalTimeoutMs, createdAt: Date.now() };
 	a.timer = setTimeout(() => decideApproval(a.id, false, "timeout"), a.timeoutMs);
 	approvals.set(a.id, a);
-	log("approval_request", { chatId, id: a.id, why: a.why, cmd: String(a.command).slice(0, 200) });
+	log("approval_request", { chatId, id: a.id, why: a.why, critical: a.critical, mode: modeOf(owner), cmd: String(a.command).slice(0, 200) });
 	// 先把之前的话收尾，审批卡出现在它下面；如果当前只有「…」占位卡，就直接把占位卡改成审批卡（不撤回、不多一条）
 	let reuseCardKey;
 	const cur = answer.get(chatId);
@@ -285,11 +317,12 @@ function onApprovalRequest(chatId, s, rec) {
 		answer.delete(chatId);
 	} else answerFlush(chatId, { final: true });
 	if ((chats[chatId]?.channel ?? "local") === "feishu")
-		say(chatId, "approval", a.command, { approvalId: a.id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state: "pending", reuseCardKey });
-	else say(chatId, "attention", `接下来这条命令${a.why}，你同意我执行吗？\n${a.command}\n（回「可以」或「先别」）`, { approvalId: a.id });
+		say(chatId, "approval", a.command, { approvalId: a.id, command: a.command, why: a.why, critical: a.critical, timeoutMs: a.timeoutMs, state: "pending", reuseCardKey });
+	else
+		say(chatId, "attention", `接下来这条命令${a.why}，你同意我执行吗？\n${a.command}\n（回「可以」或「先别」${a.critical ? "；这类命令就算设了始终允许也会问你" : "，或者「以后都允许」"}）`, { approvalId: a.id });
 }
 
-function decideApproval(id, approved, how, { tellPi = true } = {}) {
+function decideApproval(id, approved, how, { tellPi = true, always = false } = {}) {
 	const a = approvals.get(id);
 	if (!a) return false;
 	approvals.delete(id);
@@ -298,13 +331,51 @@ function decideApproval(id, approved, how, { tellPi = true } = {}) {
 	try {
 		if (tellPi && a.session.alive) a.session.write({ type: "extension_ui_response", id, confirmed: !!approved });
 	} catch {}
-	const state = approved ? "approved" : how === "timeout" ? "timeout" : how === "cancelled" ? "cancelled" : "denied";
+	const state = approved ? (always ? "approved_always" : "approved") : how === "timeout" ? "timeout" : how === "cancelled" ? "cancelled" : "denied";
 	log("approval_decision", { chatId: a.chatId, id, state, how, waitedMs: Date.now() - a.createdAt });
 	if ((chats[a.chatId]?.channel ?? "local") === "feishu")
-		say(a.chatId, "approval", a.command, { approvalId: id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state });
-	if (state !== "cancelled" && chats[a.chatId]?.running) answerOpen(a.chatId); // 接着干活：新回答卡（带停止）出现在审批卡下面
+		say(a.chatId, "approval", a.command, { approvalId: id, command: a.command, why: a.why, critical: a.critical, timeoutMs: a.timeoutMs, state });
+	// 拒绝 / 超时：模型接下来那一句话并进这张审批卡，不单独再发一条
+	if (approved && toolRunning.get(a.chatId)) answerOpen(a.chatId); // 批准后命令开跑：跑久了也有「停止」按钮
+	if ((state === "denied" || state === "timeout") && isQuiet(a.chatId)) mergeNext.set(a.chatId, { id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state });
 	return true;
 }
+// ---- 授权模式：每次询问（ask，默认）/ 始终允许（always）----
+// 每个主人一份，存在 数据目录/approval-modes.json（重启不丢）；没设置过就用环境变量 PI_APPROVAL_MODE。
+// 「始终允许」只放行普通危险命令；带 critical 的灾难级命令（alwaysAskRules）任何模式都问。
+const modesFile = join(DATA, "approval-modes.json");
+const defaultMode = process.env.PI_APPROVAL_MODE === "always" ? "always" : "ask";
+let modes = {};
+try {
+	modes = JSON.parse(readFileSync(modesFile, "utf8"));
+} catch {}
+const ownerOf = (chatId) => chats[chatId]?.owner ?? `${chats[chatId]?.channel ?? "local"}:chat:${chatId}`;
+const modeOf = (owner) => modes[owner]?.mode ?? defaultMode;
+const MODE_NAME = { ask: "每次询问", always: "始终允许" };
+function setMode(owner, mode, how, chatId) {
+	const from = modeOf(owner);
+	modes[owner] = { mode, at: cst(), how };
+	try {
+		mkdirSync(DATA, { recursive: true });
+		writeFileSync(modesFile + ".tmp", JSON.stringify(modes, null, 1));
+		renameSync(modesFile + ".tmp", modesFile);
+	} catch (e) {
+		log("approval_mode_save_error", { err: String(e?.message ?? e) });
+	}
+	log("approval_mode", { chatId, owner, from, to: mode, how });
+	return from;
+}
+// 切换后回的那一句话（自然口吻，不是系统日志）
+function modeSentence(mode, from) {
+	if (mode === "always")
+		return from === "always"
+			? "现在本来就不用问你，只有删整个系统、格式化磁盘、关机、改我自己密钥这类特别危险的才会先问。"
+			: "好，以后一般的危险命令我直接做，不再问你；删整个系统、格式化磁盘、关机、改我自己密钥这类还是会先问。";
+	return from === "ask" ? "现在本来就是每次都先问你。" : "好，以后执行危险命令前还是每次先问你。";
+}
+const modeRe = { always: reList(policy.approval?.alwaysPatterns), ask: reList(policy.approval?.askPatterns), settings: reList(policy.approval?.settingsPatterns) };
+let modeCardSeq = 0;
+
 const pendingApprovalOf = (chatId) => [...approvals.values()].filter((a) => a.chatId === chatId);
 
 // ---- 入站：Gate → 命令 → 意图 → RPC ----
@@ -326,9 +397,10 @@ function handleInbound(msg) {
 	return p.then(() => result);
 }
 
-async function processInbound({ channel, chatId, text, receivedAt, messageId }) {
+async function processInbound({ channel, chatId, senderId, text, receivedAt, messageId }) {
 	chats[chatId] ??= { sessionId: `chat-${safeId(chatId)}`, createdAt: cst() };
 	chats[chatId].channel = channel;
+	if (senderId) chats[chatId].owner = `${channel}:${senderId}`;
 	if (messageId) chats[chatId].lastMessageId = messageId;
 	const t = text.trim();
 	log("inbound", { chatId, channel, chars: t.length, text: t.slice(0, 200) });
@@ -348,6 +420,28 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 		return { intent: "new", sessionId: sid };
 	}
 
+	// 授权模式：「以后不用问我了 / 始终允许」「恢复每次询问」「授权设置」——网关直接处理，不交给模型
+	if (modeRe.settings.some((r) => r.test(t))) {
+		const mode = modeOf(ownerOf(chatId));
+		log("approval_mode_view", { chatId, owner: ownerOf(chatId), mode });
+		if (channel === "feishu") say(chatId, "mode_card", "", { modeCardId: `${startedAt}-${++modeCardSeq}`, mode });
+		else say(chatId, "reply", `现在是「${MODE_NAME[mode]}」。想换的话说「${mode === "always" ? "恢复每次询问" : "始终允许"}」就行，也可以在飞书里发「授权设置」用按钮切。`);
+		return { intent: "mode_view", mode };
+	}
+	for (const mode of ["always", "ask"])
+		if (modeRe[mode].some((r) => r.test(t))) {
+			const from = setMode(ownerOf(chatId), mode, "text", chatId);
+			// 正在等审批时说「以后都允许」：这一条也一起放行（灾难级的除外，还得单独点头）
+			let note = "";
+			if (mode === "always")
+				for (const a of pendingApprovalOf(chatId)) {
+					if (a.critical) note = "不过刚才那条比较危险，还得你单独点一下同意。";
+					else decideApproval(a.id, true, "text", { always: true });
+				}
+			say(chatId, "reply", modeSentence(mode, from) + note);
+			return { intent: "mode_set", mode, from };
+		}
+
 	// 审批进行中：直接回「可以 / 先别」也算数；喊停 → 取消审批并停下；别的话 → 当作不同意，再按插话处理
 	const pend = pendingApprovalOf(chatId);
 	if (pend.length) {
@@ -366,10 +460,7 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 
 	const s = getSession(chatId);
 	const busy = s.busy;
-	if (busy && answer.has(chatId)) {
-		answerFlush(chatId, { final: true }); // 插话：之前的回答收尾，新回答另起一张
-		answerOpen(chatId);
-	}
+	// 插话时不另起卡：当前这张回答卡继续往下长（不撤回、不收尾）
 	const intent = busy ? classify(policy, t) : t === "/abort" ? "noop" : "prompt";
 	const t0 = receivedAt ?? Date.now();
 	marks.set(chatId, { t0, kind: intent });
@@ -437,9 +528,19 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 }
 
 for (const ch of channels.values()) ch.onInbound(handleInbound);
-feishu?.onCardAction(({ chatId, value }) => {
+feishu?.onCardAction(({ chatId, senderId, value }) => {
+	if (chatId && senderId && chats[chatId]) chats[chatId].owner = `feishu:${senderId}`;
+	if (value?.pibot === "mode" && (value.mode === "ask" || value.mode === "always")) {
+		const owner = senderId ? `feishu:${senderId}` : ownerOf(chatId);
+		const from = setMode(owner, value.mode, "card", chatId);
+		// 设置卡原地更新：高亮新模式 + 一句话（不另发消息）
+		say(chatId, "mode_card", "", { modeCardId: value.card, mode: value.mode, note: modeSentence(value.mode, from) });
+		return {};
+	}
 	if (value?.pibot === "approval") {
-		const okd = decideApproval(value.id, !!value.ok, "card");
+		const pending = approvals.get(value.id);
+		if (value.always && pending && !pending.critical) setMode(senderId ? `feishu:${senderId}` : ownerOf(chatId), "always", "approval_card", chatId);
+		const okd = decideApproval(value.id, !!value.ok, "card", { always: !!value.always && !!pending && !pending.critical });
 		if (!okd) log("approval_stale_click", { chatId, id: value.id });
 		return {};
 	}
