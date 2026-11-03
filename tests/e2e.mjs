@@ -78,7 +78,7 @@ async function testMemory() {
 	const A = `mem-a-${tag}`, B = `mem-b-${tag}`;
 	note("【测试1 记忆跨重启】在会话 A 说出长期偏好 → 重启网关 → 全新会话 B 提问，看是否自然用上且不复述记忆");
 	let t0 = Date.now();
-	await send(A, "记一下我的长期偏好：以后叫我「老蛇」，回答尽量用三条要点，结尾加一句「—— AI之境」。我最喜欢的编程语言是 Rust。");
+	await send(A, "记一下我的长期偏好：以后叫我「老蛇」，回答尽量用三条要点。我最喜欢的编程语言是 Rust。");
 	await waitEvent(t0, A, "agent_settled");
 	await sleep(1500);
 	note(`A 的回复：\n${botText(A, t0)}`);
@@ -91,9 +91,9 @@ async function testMemory() {
 	await sleep(1500);
 	const txt = botText(B, t0);
 	note(`B 的回复（${st.sinceMarkMs}ms）：\n${txt}`);
-	const checks = { 称呼老蛇: /老蛇/.test(txt), 提到Rust: /Rust/i.test(txt), 署名: /AI之境/.test(txt), 没复述记忆: !/根据(我的)?记忆|我记得你|你之前(说|告诉)/.test(txt) };
+	const checks = { 称呼老蛇: /老蛇/.test(txt), 提到Rust: /Rust/i.test(txt), 没加署名: !/——\s*AI之境/.test(txt), 没复述记忆: !/根据(我的)?记忆|我记得你|你之前(说|告诉)/.test(txt) };
 	note(`检查：${JSON.stringify(checks)}`);
-	const pass = checks.称呼老蛇 && checks.没复述记忆 && (checks.提到Rust || checks.署名);
+	const pass = checks.称呼老蛇 && checks.没复述记忆 && checks.提到Rust && checks.没加署名;
 	note(`结果：${pass ? "PASS" : "FAIL"}`);
 	save(`01-memory-${tag}`);
 	return pass;
