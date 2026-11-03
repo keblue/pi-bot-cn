@@ -1,9 +1,17 @@
 {
   "_comment": "运行中收到新消息时怎么处理。cancel=清队列+abort+杀进程组；redirect=立即打断当前工具并 steer；followUp=做完再说；其余默认 steer（像真人插话）。正则按顺序匹配。",
   "cancelMaxLength": 12,
-  "cancelPatterns": ["^(停|停下|停止|停一下|先停|取消|别做了|不做了|不用了|算了|打住|stop|cancel|abort)[!！。.~～ ]*$", "^/(abort|stop)$"],
-  "redirectPatterns": ["^(改成|改为|换成|改一下|换个|先别|别.{0,8}了[，,]|不要.{0,8}了[，,]|不对[，,]|算了[，,])", "^/redirect\\s"],
-  "followUpPatterns": ["^(做完|弄完|完了以后|完了之后|之后再|然后再|等你做完|顺便最后)"],
+  "cancelPatterns": [
+    "^(停|停下|停止|停一下|先停|取消|别做了|不做了|不用了|算了|打住|stop|cancel|abort)[!！。.~～ ]*$",
+    "^/(abort|stop)$"
+  ],
+  "redirectPatterns": [
+    "^(改成|改为|换成|改一下|换个|先别|别.{0,8}了[，,]|不要.{0,8}了[，,]|不对[，,]|算了[，,])",
+    "^/redirect\\s"
+  ],
+  "followUpPatterns": [
+    "^(做完|弄完|完了以后|完了之后|之后再|然后再|等你做完|顺便最后)"
+  ],
   "defaultWhileBusy": "steer",
   "hardInterruptOnRedirect": true,
   "redirectWhileThinking": "abort_and_prompt",
@@ -13,6 +21,68 @@
     "cancel": "好，停了。",
     "redirect": "收到，马上改。",
     "followUp": "好，这个做完就接着弄。",
-    "steer": ""
+    "steer": "",
+    "restart": "刚才我重启了一下，你让我做的那件事没做完。要我接着做吗？",
+    "error": "哎，刚才出了点问题没弄完（{err}）。要我再试一次吗？"
+  },
+  "_comment_quiet": "quietChannels 里的通道只收到自然对话：不发「收到/停了/正在执行」之类的状态消息和工具进度；打断信息只写服务器日志 interrupts.jsonl / gateway.jsonl。",
+  "quietChannels": [
+    "feishu"
+  ],
+  "approval": {
+    "_comment": "危险命令执行前先问主人（飞书里是一张「可以/先别」卡片；本地通道是一句话）。超时=不做。审批期间说「停/取消」也立即生效。",
+    "enabled": true,
+    "timeoutMinutes": 10,
+    "approvePatterns": [
+      "^(可以|允许|同意|批准|行|好|好的|执行|执行吧|没问题|ok|okay|yes|y)[!！。.~～ ]*$"
+    ],
+    "denyPatterns": [
+      "^(不行|不可以|拒绝|不要|别|先别|不用|不同意|no|n)[!！。.~～ ]*$"
+    ],
+    "rules": [
+      {
+        "re": "(^|[;&|`(]\\s*|\\s)sudo\\s",
+        "why": "要用管理员权限（sudo）"
+      },
+      {
+        "re": "\\brm\\s+(-[a-zA-Z]*[rRf]|.*[*?])",
+        "why": "会删除文件（可能不止一个）"
+      },
+      {
+        "re": "\\bfind\\b.*\\s-(delete|exec\\s+rm)|\\bxargs\\s+rm\\b|\\bshred\\b|\\bmkfs|\\bdd\\s+.*of=|\\btruncate\\s",
+        "why": "会批量删除或覆盖数据"
+      },
+      {
+        "re": "\\b(systemctl|service|reboot|shutdown|poweroff|crontab\\s+-r|pkill|killall)\\b|\\bkill\\s+-9",
+        "why": "会改动系统服务或结束进程"
+      },
+      {
+        "re": "\\b(chmod|chown)\\s+-R\\b|\\bmv\\s+.*[*?]|>\\s*/(etc|usr|boot|var)/",
+        "why": "会批量改权限或覆盖系统文件"
+      },
+      {
+        "re": "\\bgit\\s+(push|reset\\s+--hard|clean\\s+-[a-z]*f)",
+        "why": "会改写或推送 Git 历史"
+      },
+      {
+        "re": "\\b(curl|wget)\\b.*(\\s-(T|F|d)\\s|--data|--upload-file|--form|-X\\s*(POST|PUT|DELETE|PATCH))|\\b(scp|sftp|rsync)\\b.*\\S+:|\\b(nc|ncat|ssh)\\s",
+        "why": "会把数据发送或上传到外部"
+      },
+      {
+        "re": "(\\.env\\b|/\\.ssh/|pi-bot-cn/env|id_(rsa|ed25519)|\\.pem\\b|credentials|api[_-]?key|secret)",
+        "why": "会碰到密钥或配置文件"
+      },
+      {
+        "re": "\\b(npm\\s+publish|apt(-get)?\\s+(remove|purge))\\b",
+        "why": "会发布包或卸载软件"
+      }
+    ],
+    "protectedPathPatterns": [
+      "(^|/)\\.env($|\\.)",
+      "/\\.ssh/",
+      "pi-bot-cn/env",
+      "\\.pem$",
+      "id_(rsa|ed25519)"
+    ]
   }
 }

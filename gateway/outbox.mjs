@@ -68,6 +68,11 @@ export class Outbox {
 		return msg;
 	}
 
+	async drain(maxMs = 1500) {
+		const t0 = Date.now();
+		while (this.pendingCount() && Date.now() - t0 < maxMs) await new Promise((r) => setTimeout(r, 50));
+	}
+
 	kickAll() {
 		for (const chatId of this.pending.keys()) this.kick(chatId);
 	}
@@ -79,6 +84,12 @@ export class Outbox {
 			const list = this.pending.get(chatId) ?? [];
 			while (list.length) {
 				const msg = list[0];
+				// 同一张卡片的更新是「全量快照」：后面还有更新的就跳过旧的（飞书 patch 限频 + 积压时省时间）
+				if (msg.supersedeKey && list.slice(1).some((m) => m.supersedeKey === msg.supersedeKey)) {
+					appendFileSync(this.file, JSON.stringify({ op: "done", id: msg.id, at: cst(), superseded: true }) + "\n");
+					list.shift();
+					continue;
+				}
 				try {
 					await this.deliver(msg);
 					appendFileSync(this.file, JSON.stringify({ op: "done", id: msg.id, at: cst() }) + "\n");

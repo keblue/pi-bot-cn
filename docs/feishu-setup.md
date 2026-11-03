@@ -65,7 +65,18 @@ grep FEISHU_WS_CONNECTED ~/pi-bot-cn-data/logs/gateway.jsonl | tail -1
 2. **「订阅方式」** 选 **「使用长连接接收回调」** → **「保存」**。
 3. 点 **「添加回调」** → 勾选 **「卡片回传交互」**（`card.action.trigger`）→ **「确认添加」**。
 
-   这样回复卡片上的 **「停止」按钮**才能用。
+   这样回复卡片上的 **「停止」按钮**和危险命令审批卡上的 **「可以，执行」/「先别」按钮**才能用。
+
+   验证一下（服务器上运行，不会打印任何密钥）：
+
+   ```bash
+   cd ~/pi-bot-cn
+   set -a; . ~/.config/pi-bot-cn/env; set +a
+   node scripts/feishu-test-card.mjs        # 给你发一张测试卡，输出 {"ok":true,"cardSchema":"2.0","readBackMsgType":"interactive",...}
+   ```
+
+   在飞书里点测试卡上的 **「点我试试」**，弹出「按钮回调收到了 👍」，并且 `grep feishu_card_ping ~/pi-bot-cn-data/logs/gateway.jsonl` 能搜到一行，就说明回调通了。
+   想把整套卡片（占位卡 → 审批卡 → 回答卡 → 撤回）都过一遍：`node scripts/feishu-card-flow-test.mjs`。
 
 ## 第 8 步：发布版本
 
@@ -86,6 +97,7 @@ grep FEISHU_WS_CONNECTED ~/pi-bot-cn-data/logs/gateway.jsonl | tail -1
 ```bash
 grep feishu_owner_hint ~/pi-bot-cn-data/logs/gateway.jsonl | tail -1     # 找 "senderOpenId":"ou_..."
 echo 'PI_BOT_OWNER_OPEN_IDS=ou_你的open_id' >> ~/.config/pi-bot-cn/env      # 网关会自动重启
+curl -s 127.0.0.1:8787/health | grep -o '"owners":[0-9]*'                   # 显示 "owners":1 就锁好了
 ```
 
 ## 常见问题
@@ -95,6 +107,9 @@ echo 'PI_BOT_OWNER_OPEN_IDS=ou_你的open_id' >> ~/.config/pi-bot-cn/env      # 
 | 保存长连接时提示「未检测到应用连接」 | 网关没跑或凭证填错。`systemctl status pi-bot-cn`、`curl -s 127.0.0.1:8787/health` 看 `feishu.state` 和 `lastError` |
 | 发消息机器人不理 | 版本没发布 / 可用范围没包含你 / 没加「接收消息 v2.0」事件；或已锁定主人但 open_id 不对（日志里有 `feishu_gate_drop`） |
 | 点「停止」没反应 | 没加「卡片回传交互」回调，或加完没重新发布版本 |
+| 点「可以，执行」/「先别」没反应 | 同上；或卡片已过期（10 分钟超时后再点，日志里是 `approval_stale_click`），直接回一句「可以」也行 |
+| 卡片显示成「请升级客户端」 | 飞书客户端太旧，不支持卡片 JSON 2.0。网关在接口拒收 2.0 时会自动退回 1.0（日志 `feishu_card_v2_rejected`）；客户端只是旧的话，升级飞书就行 |
+| 聊天里看不到「正在执行」之类的进度 | 正常，这是故意的：飞书里只留自然对话，进度只写日志（`quiet_suppressed`）。想看就在服务器上 `tail -f ~/pi-bot-cn-data/logs/gateway.jsonl` |
 | 回复只出现一半就不动了 | 看日志 `outbox_retry`：飞书接口限流或网络抖动，Outbox 会自动重试补发 |
 
 ——「AI之境」

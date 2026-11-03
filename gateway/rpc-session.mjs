@@ -65,7 +65,12 @@ export class RpcSession extends EventEmitter {
 			return;
 		}
 		if (rec.type === "extension_ui_request") {
-			// 飞书卡片审批接上之前：对话框一律「取消」（= 拒绝），不让会话卡死
+			// 危险命令审批（duet-core 发出的 confirm，title=pibot-approval）交给网关 → 飞书卡片
+			if (rec.method === "confirm" && rec.title === "pibot-approval") {
+				this.emit("approval", rec);
+				return;
+			}
+			// 其它对话框：一律「取消」（= 拒绝），不让会话卡死
 			if (["select", "confirm", "input", "editor"].includes(rec.method)) {
 				this.write({ type: "extension_ui_response", id: rec.id, cancelled: true });
 			}

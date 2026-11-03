@@ -1,6 +1,6 @@
 // duet-gateway：pi-bot-cn 的常驻网关（公众号「AI之境」）
 // 通道（local / feishu）→ Gate → 按 chatId 串行 → 常驻 pi RPC 会话 → 事件流 → Outbox → 通道
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +31,7 @@ for (const d of [DATA, cfg.workspace, cfg.memoryDir, cfg.sessionsDir, join(DATA,
 const log = makeLogger(join(DATA, "logs/gateway.jsonl"));
 const policy = loadPolicy(readFileSync(cfg.policyFile, "utf8"));
 const startedAt = Date.now();
+let stopping = false;
 
 // ---- chat 状态持久化（重启后知道每个 chat 用哪个 session、上次是否在跑）----
 const chatsFile = join(DATA, "chats.json");
@@ -58,8 +59,17 @@ const outbox = new Outbox(join(DATA, "outbox/outbox.jsonl"), {
 });
 local.onUp = () => outbox.kickAll();
 
+// 安静通道（飞书）：网关自己拼的回执（「好，停了。已终止…」「收到，马上改」「🔧 正在执行：命令」）一律不发，只写日志；
+// 聊天窗口里只有模型自己说的话 + 回答卡上的「停止」按钮 + 危险命令的审批卡。
+const quiet = new Set(policy.quietChannels ?? []);
+const isQuiet = (chatId) => quiet.has(chats[chatId]?.channel ?? "local");
 function say(chatId, purpose, text, extra = {}) {
 	const channel = chats[chatId]?.channel ?? "local";
+	if (quiet.has(channel) && (purpose === "ack" || purpose === "progress")) {
+		log("quiet_suppressed", { chatId, purpose, text: String(text).slice(0, 80) });
+		return null;
+	}
+	if (purpose === "reply") purpose = "ack"; // 主人主动发的命令（/status /new）的回答：照常发
 	if (purpose === "ack" && extra.replyTo === undefined && chats[chatId]?.lastMessageId) extra.replyTo = chats[chatId].lastMessageId;
 	return outbox.enqueue(chatId, purpose, text, { channel, ...extra });
 }
@@ -88,6 +98,47 @@ function flushStream(chatId, { final = false } = {}) {
 }
 const turnHasText = new Map();
 
+// ---- 飞书回答卡：一次运行（agent_start→agent_settled）一张卡，只放模型说的话，原地 patch ----
+// 运行开始就有卡（带「停止」按钮）：1.2s 内有文字就直接带文字发，否则先发「…」占位；
+// 结束时去掉按钮；一个字都没说就结束（比如刚开始就被喊停）→ 撤回占位卡，保持安静。
+// 主人插话改道后另起一张，让新回答出现在插话下面，像正常聊天。
+const answer = new Map(); // chatId -> {key, text, timer, sentLen, needSep}
+let answerSeg = 0;
+function answerFor(chatId) {
+	let a = answer.get(chatId);
+	if (!a) answer.set(chatId, (a = { key: `${chatId}:${chats[chatId]?.sessionId}:${startedAt}:${++answerSeg}`, text: "", sentLen: 0, timer: null, needSep: false, placeholder: null }));
+	return a;
+}
+function answerOpen(chatId) {
+	if (!isQuiet(chatId)) return;
+	const a = answerFor(chatId);
+	if (a.sentLen || a.placeholder) return;
+	a.placeholder = setTimeout(() => {
+		if (answer.get(chatId) !== a || a.sentLen || a.text.trim()) return;
+		say(chatId, "card", "…", { cardKey: a.key, final: false, supersedeKey: a.key });
+		a.sentLen = -1; // 占位卡已发
+	}, 1200);
+}
+function answerAppend(chatId, delta) {
+	const a = answerFor(chatId);
+	if (a.needSep && a.text.trim()) a.text += "\n\n";
+	a.needSep = false;
+	a.text += delta;
+	if (!a.timer) a.timer = setTimeout(() => answerFlush(chatId), a.sentLen ? 700 : 400);
+}
+function answerFlush(chatId, { final = false } = {}) {
+	const a = answer.get(chatId);
+	if (!a) return;
+	clearTimeout(a.timer);
+	a.timer = null;
+	const text = a.text.trim();
+	if (text && (text.length !== a.sentLen || final)) {
+		say(chatId, "card", text, { cardKey: a.key, final, supersedeKey: a.key });
+		a.sentLen = text.length;
+	} else if (!text && final && a.sentLen === -1) say(chatId, "card", "", { cardKey: a.key, final: true, supersedeKey: a.key }); // 撤回占位卡
+	if (final) clearTimeout(a.placeholder), answer.delete(chatId);
+}
+
 function getSession(chatId) {
 	let s = sessions.get(chatId);
 	if (s?.alive) return s;
@@ -111,13 +162,17 @@ function getSession(chatId) {
 		PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS: process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS || "8000",
 		PIBOT_DATA_DIR: DATA,
 		PIBOT_CHAT_ID: chatId,
+		PIBOT_INTERRUPT_POLICY: cfg.policyFile,
 	};
 	s = new RpcSession({ chatId, sessionId, piBin: cfg.piBin, args, cwd: cfg.workspace, env, log });
 	s.on("event", (ev) => onEvent(chatId, s, ev));
+	s.on("approval", (rec) => onApprovalRequest(chatId, s, rec));
 	s.on("exit", (e) => {
 		log("session_exit", { chatId, ...e });
 		flushStream(chatId);
-		if (chats[chatId]) (chats[chatId].running = false), saveChats();
+		answerFlush(chatId, { final: true });
+		for (const a of approvals.values()) if (a.chatId === chatId) decideApproval(a.id, false, "cancelled");
+		if (chats[chatId] && !stopping) (chats[chatId].running = false), saveChats(); // 网关关停时保留 running，新进程据此知道有活没干完
 	});
 	s.start();
 	sessions.set(chatId, s);
@@ -131,11 +186,13 @@ function onEvent(chatId, s, ev) {
 	const mark = marks.get(chatId);
 	switch (ev.type) {
 		case "agent_start":
+			answerOpen(chatId);
 			chats[chatId].running = true;
 			saveChats();
 			break;
 		case "agent_settled":
 			flushStream(chatId);
+			answerFlush(chatId, { final: true });
 			chats[chatId].running = false;
 			saveChats();
 			log("agent_settled", { chatId, aborted: ev.aborted, sinceMarkMs: mark ? Date.now() - mark.t0 : undefined });
@@ -143,6 +200,7 @@ function onEvent(chatId, s, ev) {
 		case "tool_execution_start":
 			flushStream(chatId);
 			log("tool_start", { chatId, tool: ev.toolName, cmd: ev.toolName === "bash" ? String(ev.args?.command).slice(0, 200) : undefined });
+			if (answer.has(chatId)) answerFlush(chatId); // 工具开跑前把已有文字推出去
 			if (policy.showToolProgress && ev.toolName === "bash")
 				say(chatId, "progress", `🔧 正在执行：${String(ev.args?.command ?? "").split("\n")[0].slice(0, 120)}`);
 			break;
@@ -166,6 +224,10 @@ function onEvent(chatId, s, ev) {
 				mark.firstDelta = Date.now();
 				log("first_text_after_mark", { chatId, kind: mark.kind, latencyMs: mark.firstDelta - mark.t0 });
 			}
+			if (isQuiet(chatId)) {
+				answerAppend(chatId, a.delta);
+				break;
+			}
 			let b = streamBuf.get(chatId);
 			if (!b) streamBuf.set(chatId, (b = { text: "" }));
 			b.text += a.delta;
@@ -180,7 +242,9 @@ function onEvent(chatId, s, ev) {
 			const m = ev.message;
 			if (m?.role === "assistant") {
 				flushStream(chatId, { final: true });
-				if (m.stopReason === "error" && !/abort/i.test(String(m.errorMessage ?? ""))) say(chatId, "attention", `⚠️ 模型出错：${String(m.errorMessage ?? "").slice(0, 200)}`);
+				if (answer.has(chatId)) answer.get(chatId).needSep = true;
+				if (m.stopReason === "error" && !/abort/i.test(String(m.errorMessage ?? "")))
+					say(chatId, "attention", (policy.acks?.error ?? "哎，刚才出了点问题没弄完（{err}）。要我再试一次吗？").replace("{err}", String(m.errorMessage ?? "").slice(0, 120)));
 			}
 			break;
 		}
@@ -193,9 +257,65 @@ function onEvent(chatId, s, ev) {
 	}
 }
 
+// ---- 危险命令审批（Grok Bot 式 approval）----
+// duet-core 在执行危险命令前发 confirm(title=pibot-approval)；这里变成「可以，执行 / 先别」卡片。
+// 决定方式：点按钮 / 直接回「可以」「先别」/ 超时（=不做）/ 喊停或插话（=取消）。
+const approvals = new Map(); // id -> {id, chatId, session, command, why, timeoutMs, createdAt, timer}
+const approvalTimeoutMs = (policy.approval?.timeoutMinutes ?? 10) * 60_000;
+const reList = (arr) => (arr ?? []).map((x) => new RegExp(x, "i"));
+const approveRe = reList(policy.approval?.approvePatterns);
+const denyRe = reList(policy.approval?.denyPatterns);
+
+function onApprovalRequest(chatId, s, rec) {
+	let req = {};
+	try {
+		req = JSON.parse(rec.message ?? "{}");
+	} catch {}
+	const a = { id: rec.id, chatId, session: s, command: req.command ?? "", why: req.why ?? "", timeoutMs: req.timeoutMs ?? approvalTimeoutMs, createdAt: Date.now() };
+	a.timer = setTimeout(() => decideApproval(a.id, false, "timeout"), a.timeoutMs);
+	approvals.set(a.id, a);
+	log("approval_request", { chatId, id: a.id, why: a.why, cmd: String(a.command).slice(0, 200) });
+	// 先把之前的话收尾，审批卡出现在它下面；如果当前只有「…」占位卡，就直接把占位卡改成审批卡（不撤回、不多一条）
+	let reuseCardKey;
+	const cur = answer.get(chatId);
+	if (cur && !cur.text.trim()) {
+		clearTimeout(cur.placeholder);
+		clearTimeout(cur.timer);
+		if (cur.sentLen === -1) reuseCardKey = cur.key;
+		answer.delete(chatId);
+	} else answerFlush(chatId, { final: true });
+	if ((chats[chatId]?.channel ?? "local") === "feishu")
+		say(chatId, "approval", a.command, { approvalId: a.id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state: "pending", reuseCardKey });
+	else say(chatId, "attention", `接下来这条命令${a.why}，你同意我执行吗？\n${a.command}\n（回「可以」或「先别」）`, { approvalId: a.id });
+}
+
+function decideApproval(id, approved, how, { tellPi = true } = {}) {
+	const a = approvals.get(id);
+	if (!a) return false;
+	approvals.delete(id);
+	clearTimeout(a.timer);
+	// 喊停/插话时不回 pi：紧接着的 abort / pibot-interrupt 会让对话框自己结束，工具按「被打断」收尾
+	try {
+		if (tellPi && a.session.alive) a.session.write({ type: "extension_ui_response", id, confirmed: !!approved });
+	} catch {}
+	const state = approved ? "approved" : how === "timeout" ? "timeout" : how === "cancelled" ? "cancelled" : "denied";
+	log("approval_decision", { chatId: a.chatId, id, state, how, waitedMs: Date.now() - a.createdAt });
+	if ((chats[a.chatId]?.channel ?? "local") === "feishu")
+		say(a.chatId, "approval", a.command, { approvalId: id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state });
+	if (state !== "cancelled" && chats[a.chatId]?.running) answerOpen(a.chatId); // 接着干活：新回答卡（带停止）出现在审批卡下面
+	return true;
+}
+const pendingApprovalOf = (chatId) => [...approvals.values()].filter((a) => a.chatId === chatId);
+
 // ---- 入站：Gate → 命令 → 意图 → RPC ----
 const chains = new Map();
+const lateInbox = join(DATA, "outbox/late-inbound.jsonl"); // 关停期间收到的消息：落盘，新进程接着处理
 function handleInbound(msg) {
+	if (stopping) {
+		appendFileSync(lateInbox, JSON.stringify(msg) + "\n");
+		log("inbound_deferred", { chatId: msg.chatId, channel: msg.channel });
+		return Promise.resolve({ deferred: true });
+	}
 	const prev = chains.get(msg.chatId) ?? Promise.resolve();
 	let result;
 	const p = prev.then(async () => (result = await processInbound(msg))).catch((e) => {
@@ -215,7 +335,7 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 
 	if (t === "/status") {
 		const s = sessions.get(chatId);
-		say(chatId, "ack", `会话 ${chats[chatId].sessionId}｜${s?.alive ? (s.busy ? "正在干活" : "空闲") : "未启动"}｜待发 ${outbox.pendingCount()} 条`);
+		say(chatId, "reply", `会话 ${chats[chatId].sessionId}｜${s?.alive ? (s.busy ? "正在干活" : "空闲") : "未启动"}｜待发 ${outbox.pendingCount()} 条`);
 		return { intent: "status" };
 	}
 	if (t === "/new") {
@@ -224,12 +344,32 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 		if (s?.alive) await s.stop();
 		chats[chatId].sessionId = sid;
 		saveChats();
-		say(chatId, "ack", "好，开个新话题。（记忆还在）");
+		say(chatId, "reply", "好，换个话题。之前的事我都还记得。");
 		return { intent: "new", sessionId: sid };
+	}
+
+	// 审批进行中：直接回「可以 / 先别」也算数；喊停 → 取消审批并停下；别的话 → 当作不同意，再按插话处理
+	const pend = pendingApprovalOf(chatId);
+	if (pend.length) {
+		if (approveRe.some((r) => r.test(t))) {
+			for (const a of pend) decideApproval(a.id, true, "text");
+			return { intent: "approve" };
+		}
+		if (denyRe.some((r) => r.test(t))) {
+			for (const a of pend) decideApproval(a.id, false, "text");
+			return { intent: "deny" };
+		}
+		const k = classify(policy, t);
+		const interrupting = k === "cancel" || k === "redirect";
+		for (const a of pend) decideApproval(a.id, false, "cancelled", { tellPi: !interrupting });
 	}
 
 	const s = getSession(chatId);
 	const busy = s.busy;
+	if (busy && answer.has(chatId)) {
+		answerFlush(chatId, { final: true }); // 插话：之前的回答收尾，新回答另起一张
+		answerOpen(chatId);
+	}
 	const intent = busy ? classify(policy, t) : t === "/abort" ? "noop" : "prompt";
 	const t0 = receivedAt ?? Date.now();
 	marks.set(chatId, { t0, kind: intent });
@@ -238,7 +378,14 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 	if (intent === "noop") return { intent };
 	if (intent === "prompt") {
 		s.busy = true;
-		const r = await s.request({ type: "prompt", message: t });
+		let msg = t;
+		if (chats[chatId]?.cutByRestart) {
+			delete chats[chatId].cutByRestart;
+			saveChats();
+			msg = `[网关备注，不是主人说的：上一轮任务做到一半时我重启了，那件事没做完。如果和这句话有关，或者主人可能还在等结果，就用一句自然的话顺口提一下并问要不要接着做；不相关就别提。]\n\n${t}`;
+			log("restart_note_injected", { chatId });
+		}
+		const r = await s.request({ type: "prompt", message: msg });
 		if (!r.success) {
 			s.busy = false;
 			say(chatId, "attention", `⚠️ 没接上：${r.error}`);
@@ -290,6 +437,14 @@ async function processInbound({ channel, chatId, text, receivedAt, messageId }) 
 }
 
 for (const ch of channels.values()) ch.onInbound(handleInbound);
+feishu?.onCardAction(({ chatId, value }) => {
+	if (value?.pibot === "approval") {
+		const okd = decideApproval(value.id, !!value.ok, "card");
+		if (!okd) log("approval_stale_click", { chatId, id: value.id });
+		return {};
+	}
+	return {};
+});
 
 // ---- 健康检查 ----
 local.setHealth(() => {
@@ -322,24 +477,44 @@ setInterval(() => {
 // ---- 启动：重启前没跑完的任务给主人一个交代 ----
 for (const [chatId, c] of Object.entries(chats)) {
 	if (c.running) {
-		say(chatId, "attention", "⚠️ 我刚重启了一下，上一件事没做完被打断了。要我接着做吗？");
+		// 飞书：网关模板不发（只记日志）；改成在主人下一句话前给模型一个提示，让模型自己自然地提
+		say(chatId, (c.channel ?? "local") === "feishu" ? "ack" : "attention", policy.acks?.restart ?? "刚才我重启了一下，你让我做的那件事没做完。要我接着做吗？");
 		c.running = false;
+		c.cutByRestart = true;
 	}
 }
 saveChats();
 for (const ch of channels.values()) ch.start();
 outbox.kickAll();
+// 上个进程关停期间收到的消息：按原顺序补处理
+if (existsSync(lateInbox)) {
+	const lines = readFileSync(lateInbox, "utf8").split("\n").filter(Boolean);
+	rmSync(lateInbox, { force: true });
+	for (const l of lines) {
+		try {
+			const m = JSON.parse(l);
+			log("inbound_replay", { chatId: m.chatId, channel: m.channel, ageMs: Date.now() - (m.receivedAt ?? Date.now()) });
+			handleInbound(m);
+		} catch {}
+	}
+}
 log("gateway_start", { pid: process.pid, model: `${cfg.provider}/${cfg.model}`, channels: [...channels.keys()], outboxPending: outbox.pendingCount() });
 
-let stopping = false;
 async function shutdown(sig) {
 	if (stopping) return;
 	stopping = true;
 	log("gateway_stop", { sig });
 	for (const chatId of streamBuf.keys()) flushStream(chatId);
-	for (const ch of channels.values()) ch.stop?.();
+	for (const chatId of [...answer.keys()]) answerFlush(chatId, { final: true });
+	for (const a of [...approvals.values()]) decideApproval(a.id, false, "cancelled");
+	// 先停 pi 会话（pi-memory 写退出小结要几秒），这段时间飞书长连接保持在线：
+	// 期间收到的消息落盘到 late-inbound.jsonl，新进程起来后接着处理 → 飞书侧几乎感觉不到重启
+	const t0 = Date.now();
 	await Promise.race([Promise.all([...sessions.values()].map((s) => s.stop(8000))), new Promise((r) => setTimeout(r, 12_000))]);
-	process.exit(0);
+	await Promise.race([outbox.drain?.() ?? Promise.resolve(), new Promise((r) => setTimeout(r, 1500))]);
+	log("gateway_stop_sessions_done", { tookMs: Date.now() - t0 });
+	for (const ch of channels.values()) ch.stop?.();
+	setTimeout(() => process.exit(0), 50);
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
