@@ -164,7 +164,7 @@ function onEvent(chatId, s, ev) {
 			if (a?.type !== "text_delta") break;
 			if (mark && !mark.firstDelta) {
 				mark.firstDelta = Date.now();
-				log("first_text_after_mark", { chatId, kind: mark.kind, ms: mark.firstDelta - mark.t0 });
+				log("first_text_after_mark", { chatId, kind: mark.kind, latencyMs: mark.firstDelta - mark.t0 });
 			}
 			let b = streamBuf.get(chatId);
 			if (!b) streamBuf.set(chatId, (b = { text: "" }));
@@ -180,7 +180,7 @@ function onEvent(chatId, s, ev) {
 			const m = ev.message;
 			if (m?.role === "assistant") {
 				flushStream(chatId, { final: true });
-				if (m.stopReason === "error") say(chatId, "attention", `⚠️ 模型出错：${String(m.errorMessage ?? "").slice(0, 200)}`);
+				if (m.stopReason === "error" && !/abort/i.test(String(m.errorMessage ?? ""))) say(chatId, "attention", `⚠️ 模型出错：${String(m.errorMessage ?? "").slice(0, 200)}`);
 			}
 			break;
 		}
