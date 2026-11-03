@@ -1,0 +1,27 @@
+{
+  "name": "pi-bot-cn",
+  "version": "0.0.1",
+  "description": "pi + DeepSeek + 飞书的大陆私人管家技能包；由微信公众号「AI之境」设计与维护",
+  "license": "MIT",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/keblue/pi-bot-cn.git"
+  },
+  "author": "公众号「AI之境」",
+  "keywords": [
+    "pi",
+    "deepseek",
+    "feishu",
+    "lark",
+    "agent",
+    "AI之境"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "doctor": "bash doctor.sh",
+    "install:bot": "bash install.sh"
+  }
+}

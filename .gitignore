@@ -1,0 +1,40 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-lock.yaml
+package-lock.json
+.npm/
+
+# Env & secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+**/env
+!**/*.template
+!**/*.example
+
+# Runtime / local config with possible secrets
+.config/
+.pi/
+*.local.json
+approval-state.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs & coverage
+logs/
+*.log
+coverage/
+dist/
+build/
+.tmp/
