@@ -70,6 +70,11 @@ export class RpcSession extends EventEmitter {
 				this.emit("approval", rec);
 				return;
 			}
+			// 浏览器要验证码 / 问主人（browser 扩展发出的 input，title=pibot-input）交给网关
+			if (rec.method === "input" && rec.title === "pibot-input") {
+				this.emit("input", rec);
+				return;
+			}
 			// 其它对话框：一律「取消」（= 拒绝），不让会话卡死
 			if (["select", "confirm", "input", "editor"].includes(rec.method)) {
 				this.write({ type: "extension_ui_response", id: rec.id, cancelled: true });

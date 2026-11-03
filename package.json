@@ -25,6 +25,7 @@
     "install:bot": "bash install.sh"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.68.0"
+    "@larksuiteoapi/node-sdk": "^1.68.0",
+    "playwright-core": "1.49.1"
   }
 }

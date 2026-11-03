@@ -8,8 +8,8 @@
 // - 卡片优先用 JSON 2.0（schema 2.0，config.update_multi=true），发不出去自动退回 1.0。
 // - 只有 PI_BOT_OWNER_OPEN_IDS 白名单里的人能触发模型（Gate 在进模型之前）；白名单为空时只记录日志并放行私聊。
 // - 环境里出现 FEISHU_APP_ID/SECRET 即自动启用；连接断了 SDK 自动重连，SDK 放弃后我们 15s 后整体重建。
-import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { createReadStream, existsSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
+import { basename, join } from "node:path";
 
 // 兜底：模型偶尔会模仿旧会话里的「—— AI之境」落款（人设早已不让加）。发到飞书前把结尾的署名去掉；
 // 流式输出到一半时，结尾刚冒出的「——」「—— AI」也先藏起来，后面接着有正文就会照常出现。
@@ -78,24 +78,37 @@ const DECIDED = {
 	timeout: "等了 10 分钟没等到你回复，这条我先不做了。",
 	cancelled: "好，不做了。",
 };
+const PAY_DECIDED = {
+	approved: "好，付了。",
+	denied: "好，不付了。",
+	timeout: "等了 10 分钟没等到你回复，先不付了。",
+	cancelled: "好，不付了。",
+};
 function approvalCard(a, v) {
 	const mins = Math.round((a.timeoutMs ?? 600_000) / 60_000);
-	const ask = `接下来这条命令${a.why ? `**${a.why}**` : "有点危险"}，你同意我执行吗？${a.critical ? "\n<font color='grey'>（这类特别危险的命令，就算设了「始终允许」也会每次问你）</font>" : ""}`;
-	const code = "```bash\n" + String(a.command ?? "").slice(0, 1500) + "\n```";
+	const pay = a.kind === "payment";
+	const ask = pay
+		? `要付款了 💳 你同意我点下去吗？\n<font color='grey'>（付款、下单这类操作，就算设了「始终允许」也会每次问你）</font>`
+		: `接下来这条命令${a.why ? `**${a.why}**` : "有点危险"}，你同意我执行吗？${a.critical ? "\n<font color='grey'>（这类特别危险的命令，就算设了「始终允许」也会每次问你）</font>" : ""}`;
+	const code = pay ? `**${String(a.command ?? "").slice(0, 300)}**` : "```bash\n" + String(a.command ?? "").slice(0, 1500) + "\n```";
+	const img = a.imgKey ? (v === 1 ? { tag: "img", img_key: a.imgKey, alt: { tag: "plain_text", content: "付款前的页面截图" } } : { tag: "img", img_key: a.imgKey, alt: { tag: "plain_text", content: "付款前的页面截图" }, scale_type: "fit_horizontal", preview: true }) : null;
+	const DEC = pay ? PAY_DECIDED : DECIDED;
+	const yes = pay ? "可以，付款" : "可以，执行";
 	const decided = a.state && a.state !== "pending";
 	// 拒绝后模型自己说的那句话（如果有）替换掉卡上的结果行
-	const tail = decided ? (a.note ? String(a.note).slice(0, 300) : DECIDED[a.state] ?? "好。") : `（${mins} 分钟内没回复我就先不做；直接回我「可以」「先别」也行）`;
+	const tail = decided ? (a.note ? String(a.note).slice(0, 300) : DEC[a.state] ?? "好。") : `（${mins} 分钟内没回复我就${pay ? "不付" : "先不做"}；直接回我「可以」「先别」也行）`;
 	const val = (ok, always) => (always ? { pibot: "approval", id: a.approvalId, ok, always: true } : { pibot: "approval", id: a.approvalId, ok });
 	if (v === 1) {
 		const elements = [
 			{ tag: "markdown", content: `${ask}\n${code}` },
+			...(img ? [img] : []),
 			decided ? { tag: "markdown", content: tail } : { tag: "note", elements: [{ tag: "plain_text", content: tail }] },
 		];
 		if (!decided)
 			elements.push({
 				tag: "action",
 				actions: [
-					{ tag: "button", text: { tag: "plain_text", content: "可以，执行" }, type: "primary", value: val(true) },
+					{ tag: "button", text: { tag: "plain_text", content: yes }, type: "primary", value: val(true) },
 					{ tag: "button", text: { tag: "plain_text", content: "先别" }, type: "default", value: val(false) },
 					...(a.critical ? [] : [{ tag: "button", text: { tag: "plain_text", content: "以后都允许" }, type: "default", value: val(true, true) }]),
 				],
@@ -103,7 +116,7 @@ function approvalCard(a, v) {
 		return { config: { wide_screen_mode: true, update_multi: true }, elements };
 	}
 	const btn = (label, type, ok, always) => ({ tag: "button", text: { tag: "plain_text", content: label }, type, size: "medium", behaviors: [{ type: "callback", value: val(ok, always) }] });
-	const elements = [{ tag: "markdown", content: `${ask}\n${code}` }];
+	const elements = [{ tag: "markdown", content: `${ask}\n${code}` }, ...(img ? [img] : [])];
 	if (decided) elements.push({ tag: "markdown", content: tail });
 	else
 		elements.push(
@@ -112,7 +125,7 @@ function approvalCard(a, v) {
 				tag: "column_set",
 				flex_mode: "none",
 				columns: [
-					{ tag: "column", width: "auto", elements: [btn("可以，执行", "primary_filled", true)] },
+					{ tag: "column", width: "auto", elements: [btn(yes, "primary_filled", true)] },
 					{ tag: "column", width: "auto", elements: [btn("先别", "default", false)] },
 					...(a.critical ? [] : [{ tag: "column", width: "auto", elements: [btn("以后都允许", "default", true, true)] }]),
 				],
@@ -365,19 +378,74 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 		saveCards();
 	}
 
+	// ---- 图片 / 文件：先上传拿 key，再发消息（截图带一句话时用 post 富文本，一条消息里图文都有）----
+	const imgKeys = new Map(); // 本地路径 → image_key（同一张图不重复上传）
+	async function uploadImage(path) {
+		if (imgKeys.has(path)) return imgKeys.get(path);
+		const t0 = Date.now();
+		let res;
+		try {
+			res = await client.im.v1.image.create({ data: { image_type: "message", image: createReadStream(path) } });
+		} catch (e) {
+			throw new Error("image_upload " + errStr(e));
+		}
+		const key = res?.image_key ?? res?.data?.image_key;
+		if (!key) throw new Error("image_upload 没拿到 image_key");
+		imgKeys.set(path, key);
+		log("feishu_image_upload", { apiMs: Date.now() - t0, bytes: statSync(path).size });
+		return key;
+	}
+	async function sendImage(msg) {
+		if (!msg.path || !existsSync(msg.path)) return sendText({ ...msg, text: msg.text || "（截图找不到了）" });
+		const image_key = await uploadImage(msg.path);
+		const caption = String(msg.text ?? "").trim();
+		const data = caption
+			? { msg_type: "post", content: JSON.stringify({ zh_cn: { content: [[{ tag: "text", text: caption }], [{ tag: "img", image_key }]] } }) }
+			: { msg_type: "image", content: JSON.stringify({ image_key }) };
+		const t0 = Date.now();
+		ok(await client.im.v1.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: msg.chatId, ...data } }), "send_image");
+		log("feishu_image_sent", { apiMs: Date.now() - t0, withCaption: !!caption });
+	}
+	const FILE_TYPES = { pdf: "pdf", doc: "doc", docx: "doc", xls: "xls", xlsx: "xls", ppt: "ppt", pptx: "ppt", mp4: "mp4", opus: "opus" };
+	async function sendFile(msg) {
+		if (!msg.path || !existsSync(msg.path)) return sendText({ ...msg, text: "（文件找不到了）" });
+		const name = msg.name || basename(msg.path);
+		const ext = name.split(".").pop().toLowerCase();
+		const t0 = Date.now();
+		let res;
+		try {
+			res = await client.im.v1.file.create({ data: { file_type: FILE_TYPES[ext] ?? "stream", file_name: name, file: createReadStream(msg.path) } });
+		} catch (e) {
+			throw new Error("file_upload " + errStr(e));
+		}
+		const file_key = res?.file_key ?? res?.data?.file_key;
+		if (!file_key) throw new Error("file_upload 没拿到 file_key");
+		if (String(msg.text ?? "").trim() && msg.text !== name) await sendText({ chatId: msg.chatId, text: msg.text });
+		ok(await client.im.v1.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: msg.chatId, msg_type: "file", content: JSON.stringify({ file_key }) } }), "send_file");
+		log("feishu_file_sent", { apiMs: Date.now() - t0, bytes: statSync(msg.path).size, ext });
+	}
+
 	async function sendApproval(msg) {
 		const key = "approval:" + msg.approvalId;
 		const st = cards[key];
+		// 付款审批卡带截图：第一次上传，之后更新卡片时沿用同一个 image_key
+		if (msg.image && !st?.imgKey && existsSync(msg.image)) {
+			try {
+				msg = { ...msg, imgKey: await uploadImage(msg.image) };
+			} catch (e) {
+				log("feishu_approval_image_error", { err: String(e?.message ?? e).slice(0, 160) });
+			}
+		} else if (st?.imgKey) msg = { ...msg, imgKey: st.imgKey };
 		const reuse = msg.reuseCardKey && cards[msg.reuseCardKey]?.messageId;
 		if (!st?.messageId && reuse) {
 			// 「…」占位卡原地变成审批卡
 			await patchCard(reuse, (v) => approvalCard(msg, v), "approval", { state: msg.state, reused: true });
-			cards[key] = { messageId: reuse, offset: 0 };
+			cards[key] = { messageId: reuse, offset: 0, imgKey: msg.imgKey };
 			delete cards[msg.reuseCardKey];
 			saveCards();
 		} else if (!st?.messageId) {
 			const id = await createCard(msg.chatId, (v) => approvalCard(msg, v), "approval");
-			cards[key] = { messageId: id, offset: 0 };
+			cards[key] = { messageId: id, offset: 0, imgKey: msg.imgKey };
 			saveCards();
 		} else await patchCard(st.messageId, (v) => approvalCard(msg, v), "approval", { state: msg.state });
 	}
@@ -461,12 +529,15 @@ export async function createFeishuChannel({ log, dataDir, env = process.env }) {
 		onCardAction: (fn) => (onCardAction = fn),
 		status: () => ({ ...status, since: new Date(status.since).toISOString(), lastEventAt: status.lastEventAt && new Date(status.lastEventAt).toISOString() }),
 		sendTestCard,
+		uploadImage, // 自检用：只上传不发消息
 		async send(msg) {
 			msg = stripSignature(msg);
 			if (msg.purpose === "card" && msg.cardKey) return sendAnswer(msg);
 			if (msg.purpose === "approval" && msg.approvalId) return sendApproval(msg);
 			if (msg.purpose === "mode_card" && msg.modeCardId) return sendModeCard(msg);
 			if (msg.purpose === "stream" && msg.streamKey) return sendStream(msg);
+			if (msg.purpose === "image") return sendImage(msg);
+			if (msg.purpose === "file") return sendFile(msg);
 			return sendText(msg);
 		},
 		start() {

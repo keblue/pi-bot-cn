@@ -100,6 +100,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		if (!approval.enabled || (event.toolName !== "write" && event.toolName !== "edit")) return;
 		const path = String(event.input?.path ?? event.input?.file_path ?? "");
+		// 写出来的脚本如果要直接连浏览器调试端口（绕开 browser_* 工具和付款审批），按灾难级处理
+		const body = String(event.input?.content ?? event.input?.newText ?? event.input?.new_string ?? JSON.stringify(event.input?.edits ?? ""));
+		const crit = approval.critical.find((r) => r.re.test(body) && /浏览器/.test(r.why));
+		if (crit) {
+			const ok = await ask(ctx, { tool: event.toolName, command: `${event.toolName} ${path}（脚本里要直接连浏览器）`, why: crit.why, critical: true }, ctx?.signal);
+			if (!ok) return { block: true, reason: `没有得到同意，${path} 没有写。网页操作只能用 browser_* 工具，不要另写脚本连浏览器。` };
+			return;
+		}
 		if (!approval.protectedPaths.some((r) => r.test(path))) return;
 		const ok = await ask(ctx, { tool: event.toolName, command: `${event.toolName} ${path}`, why: "会改动密钥或配置文件", critical: true }, ctx?.signal);
 		if (!ok) return { block: true, reason: `没有得到同意，${path} 没有改动。不要绕过，用一句自然的中文（用「你」称呼对方）说明这一步没做。` };

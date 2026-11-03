@@ -23,6 +23,7 @@ const cfg = {
 	memoryDir: process.env.PI_MEMORY_DIR || join(DATA, "memory"),
 	sessionsDir: join(DATA, "sessions"),
 	extension: join(REPO, "extensions/duet-core.ts"),
+	browserExtension: process.env.PIBOT_BROWSER === "0" ? null : join(REPO, "extensions/browser.ts"), // 自己的浏览器（PIBOT_BROWSER=0 关掉）
 	persona: join(REPO, "prompts/persona.md"),
 	policyFile: process.env.PIBOT_INTERRUPT_POLICY || join(REPO, "config/interrupt-policy.json"),
 };
@@ -145,7 +146,7 @@ function answerFlush(chatId, { final = false } = {}) {
 		// 审批被拒后的那句话：并进审批卡
 		if (text && text.length !== a.sentLen) {
 			const m = a.merge;
-			say(chatId, "approval", m.command, { approvalId: m.id, command: m.command, why: m.why, timeoutMs: m.timeoutMs, state: m.state, note: text, supersedeKey: `appr-note:${m.id}` });
+			say(chatId, "approval", m.command, { approvalId: m.id, command: m.command, why: m.why, kind: m.kind, critical: m.critical, timeoutMs: m.timeoutMs, state: m.state, note: text, supersedeKey: `appr-note:${m.id}` });
 			a.sentLen = text.length;
 		}
 	} else if (text && (text.length !== a.sentLen || final)) {
@@ -168,6 +169,7 @@ function getSession(chatId) {
 		"--session-dir", cfg.sessionsDir,
 		"--session-id", sessionId,
 		"-e", cfg.extension,
+		...(cfg.browserExtension ? ["-e", cfg.browserExtension] : []),
 		"--append-system-prompt", cfg.persona,
 	];
 	const env = {
@@ -183,11 +185,13 @@ function getSession(chatId) {
 	s = new RpcSession({ chatId, sessionId, piBin: cfg.piBin, args, cwd: cfg.workspace, env, log });
 	s.on("event", (ev) => onEvent(chatId, s, ev));
 	s.on("approval", (rec) => onApprovalRequest(chatId, s, rec));
+	s.on("input", (rec) => onInputRequest(chatId, s, rec));
 	s.on("exit", (e) => {
 		log("session_exit", { chatId, ...e });
 		flushStream(chatId);
 		answerFlush(chatId, { final: true });
 		for (const a of approvals.values()) if (a.chatId === chatId) decideApproval(a.id, false, "cancelled");
+		finishInput(chatId, undefined, "session_exit");
 		if (chats[chatId] && !stopping) (chats[chatId].running = false), saveChats(); // 网关关停时保留 running，新进程据此知道有活没干完
 	});
 	s.start();
@@ -216,7 +220,11 @@ function onEvent(chatId, s, ev) {
 			break;
 		case "tool_execution_start":
 			flushStream(chatId);
-			log("tool_start", { chatId, tool: ev.toolName, cmd: ev.toolName === "bash" ? String(ev.args?.command).slice(0, 200) : undefined });
+			log("tool_start", {
+				chatId,
+				tool: ev.toolName,
+				cmd: ev.toolName === "bash" ? String(ev.args?.command).slice(0, 200) : /^(browser_|send_file)/.test(ev.toolName) ? JSON.stringify(ev.args ?? {}).slice(0, 160) : undefined,
+			});
 			toolRunning.set(chatId, (toolRunning.get(chatId) ?? 0) + 1);
 			mergeNext.delete(chatId);
 			if (answer.get(chatId)?.merge) answerFlush(chatId, { final: true }); // 被拒后模型接着干别的：之后的话另起回答卡
@@ -237,6 +245,14 @@ function onEvent(chatId, s, ev) {
 				interrupted,
 				sinceMarkMs: mark ? Date.now() - mark.t0 : undefined,
 			});
+			// 浏览器截图 / 文件：模型决定发给主人的，按时间顺序插在回答中间
+			const d = ev.result?.details;
+			if (d?.pibotImage?.path || d?.pibotFile?.path) {
+				if (answer.get(chatId)?.text.trim()) answerFlush(chatId, { final: true });
+				if (d.pibotImage) say(chatId, "image", d.pibotImage.caption ?? "", { path: d.pibotImage.path });
+				if (d.pibotFile) say(chatId, "file", d.pibotFile.caption || d.pibotFile.name, { path: d.pibotFile.path, name: d.pibotFile.name });
+				log(d.pibotImage ? "browser_image_out" : "file_out", { chatId, path: (d.pibotImage ?? d.pibotFile).path });
+			}
 			break;
 		}
 		case "message_update": {
@@ -303,10 +319,10 @@ function onApprovalRequest(chatId, s, rec) {
 		if (toolRunning.get(chatId)) answerOpen(chatId);
 		return;
 	}
-	const a = { id: rec.id, chatId, session: s, command: req.command ?? "", why: req.why ?? "", critical: !!req.critical, timeoutMs: req.timeoutMs ?? approvalTimeoutMs, createdAt: Date.now() };
+	const a = { id: rec.id, chatId, session: s, command: req.command ?? "", why: req.why ?? "", critical: !!req.critical, kind: req.kind, image: req.image, timeoutMs: req.timeoutMs ?? approvalTimeoutMs, createdAt: Date.now() };
 	a.timer = setTimeout(() => decideApproval(a.id, false, "timeout"), a.timeoutMs);
 	approvals.set(a.id, a);
-	log("approval_request", { chatId, id: a.id, why: a.why, critical: a.critical, mode: modeOf(owner), cmd: String(a.command).slice(0, 200) });
+	log("approval_request", { chatId, id: a.id, why: a.why, critical: a.critical, kind: a.kind, mode: modeOf(owner), cmd: String(a.command).slice(0, 200) });
 	// 先把之前的话收尾，审批卡出现在它下面；如果当前只有「…」占位卡，就直接把占位卡改成审批卡（不撤回、不多一条）
 	let reuseCardKey;
 	const cur = answer.get(chatId);
@@ -317,7 +333,9 @@ function onApprovalRequest(chatId, s, rec) {
 		answer.delete(chatId);
 	} else answerFlush(chatId, { final: true });
 	if ((chats[chatId]?.channel ?? "local") === "feishu")
-		say(chatId, "approval", a.command, { approvalId: a.id, command: a.command, why: a.why, critical: a.critical, timeoutMs: a.timeoutMs, state: "pending", reuseCardKey });
+		say(chatId, "approval", a.command, { approvalId: a.id, command: a.command, why: a.why, critical: a.critical, kind: a.kind, image: a.image, timeoutMs: a.timeoutMs, state: "pending", reuseCardKey });
+	else if (a.kind === "payment")
+		say(chatId, "attention", `要付款了：${a.command}。你同意我点下去吗？（回「可以」或「先别」；付款就算设了始终允许也会问你）`, { approvalId: a.id, image: a.image });
 	else
 		say(chatId, "attention", `接下来这条命令${a.why}，你同意我执行吗？\n${a.command}\n（回「可以」或「先别」${a.critical ? "；这类命令就算设了始终允许也会问你" : "，或者「以后都允许」"}）`, { approvalId: a.id });
 }
@@ -334,12 +352,44 @@ function decideApproval(id, approved, how, { tellPi = true, always = false } = {
 	const state = approved ? (always ? "approved_always" : "approved") : how === "timeout" ? "timeout" : how === "cancelled" ? "cancelled" : "denied";
 	log("approval_decision", { chatId: a.chatId, id, state, how, waitedMs: Date.now() - a.createdAt });
 	if ((chats[a.chatId]?.channel ?? "local") === "feishu")
-		say(a.chatId, "approval", a.command, { approvalId: id, command: a.command, why: a.why, critical: a.critical, timeoutMs: a.timeoutMs, state });
+		say(a.chatId, "approval", a.command, { approvalId: id, command: a.command, why: a.why, critical: a.critical, kind: a.kind, timeoutMs: a.timeoutMs, state });
 	// 拒绝 / 超时：模型接下来那一句话并进这张审批卡，不单独再发一条
 	if (approved && toolRunning.get(a.chatId)) answerOpen(a.chatId); // 批准后命令开跑：跑久了也有「停止」按钮
-	if ((state === "denied" || state === "timeout") && isQuiet(a.chatId)) mergeNext.set(a.chatId, { id, command: a.command, why: a.why, timeoutMs: a.timeoutMs, state });
+	if ((state === "denied" || state === "timeout") && isQuiet(a.chatId)) mergeNext.set(a.chatId, { id, command: a.command, why: a.why, kind: a.kind, critical: a.critical, timeoutMs: a.timeoutMs, state });
 	return true;
 }
+// ---- 浏览器问主人（验证码 / 短信码 / 扫码确认）----
+// browser 扩展发 input(title=pibot-input)；网关把问题（带截图）发给主人，主人的下一句话直接回给扩展：
+// secret=true（验证码）时这句话不交给模型、日志里打码，由扩展直接填进网页。
+const inputs = new Map(); // chatId -> {id, session, question, secret, timer, createdAt}
+function onInputRequest(chatId, s, rec) {
+	let req = {};
+	try {
+		req = JSON.parse(rec.placeholder ?? "{}");
+	} catch {}
+	finishInput(chatId, undefined, "superseded");
+	const it = { id: rec.id, session: s, question: String(req.question ?? "需要你帮我一下"), secret: !!req.secret, createdAt: Date.now() };
+	it.timer = setTimeout(() => finishInput(chatId, undefined, "timeout"), req.timeoutMs ?? 300_000);
+	inputs.set(chatId, it);
+	log("input_request", { chatId, id: it.id, secret: it.secret, host: req.host });
+	if (answer.get(chatId)?.text.trim()) answerFlush(chatId, { final: true });
+	const text = it.question + (it.secret ? "\n（直接把码回给我就行，我会直接填进网页，不会显示在聊天记录和日志里）" : "");
+	if (req.image && existsSync(req.image)) say(chatId, "image", text, { path: req.image });
+	else say(chatId, "attention", text);
+}
+function finishInput(chatId, value, how) {
+	const it = inputs.get(chatId);
+	if (!it) return false;
+	inputs.delete(chatId);
+	clearTimeout(it.timer);
+	try {
+		if (it.session.alive) it.session.write(typeof value === "string" ? { type: "extension_ui_response", id: it.id, value } : { type: "extension_ui_response", id: it.id, cancelled: true });
+	} catch {}
+	log("input_done", { chatId, id: it.id, how, secret: it.secret, waitedMs: Date.now() - it.createdAt });
+	return true;
+}
+const CODE_RE = /^[A-Za-z0-9]{3,10}$/;
+
 // ---- 授权模式：每次询问（ask，默认）/ 始终允许（always）----
 // 每个主人一份，存在 数据目录/approval-modes.json（重启不丢）；没设置过就用环境变量 PI_APPROVAL_MODE。
 // 「始终允许」只放行普通危险命令；带 critical 的灾难级命令（alwaysAskRules）任何模式都问。
@@ -403,6 +453,18 @@ async function processInbound({ channel, chatId, senderId, text, receivedAt, mes
 	if (senderId) chats[chatId].owner = `${channel}:${senderId}`;
 	if (messageId) chats[chatId].lastMessageId = messageId;
 	const t = text.trim();
+	// 正在等主人给验证码：这句话直接回给浏览器，不进模型、日志打码
+	const it = inputs.get(chatId);
+	if (it && !/^\//.test(t)) {
+		const k = classify(policy, t);
+		const code = t.replace(/[\s-]/g, "");
+		if (k === "cancel") finishInput(chatId, undefined, "cancel");
+		else if (!it.secret || CODE_RE.test(code)) {
+			log("inbound", { chatId, channel, chars: t.length, text: it.secret ? "[验证码，已隐藏]" : t.slice(0, 200), forInput: true });
+			finishInput(chatId, it.secret ? code : t, "answered");
+			return { intent: "input" };
+		} else finishInput(chatId, undefined, "not_a_code"); // 不像验证码：当作普通插话
+	}
 	log("inbound", { chatId, channel, chars: t.length, text: t.slice(0, 200) });
 
 	if (t === "/status") {

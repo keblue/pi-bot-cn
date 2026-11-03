@@ -58,7 +58,7 @@ export class Outbox {
 
 	enqueue(chatId, purpose, text, extra = {}) {
 		// 空文字一般没东西可发；但卡片类（授权设置卡）本身就不靠 text，不能丢
-		if (!text && !extra.final && purpose !== "mode_card" && purpose !== "approval") return null;
+		if (!text && !extra.final && purpose !== "mode_card" && purpose !== "approval" && purpose !== "image" && purpose !== "file") return null;
 		const seq = (this.seqByChat.get(chatId) ?? 0) + 1;
 		this.seqByChat.set(chatId, seq);
 		const msg = { id: `${chatId}#${seq}`, chatId, seq, purpose, text, createdAt: cst(), ...extra };

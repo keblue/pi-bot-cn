@@ -29,3 +29,7 @@ systemctl list-timers | grep pi-bot        # 定时任务
 数据都在 `~/pi-bot-cn-data/`：`memory/`（长期记忆）、`sessions/`（对话）、`outbox/`（待发消息）、`logs/`（`gateway.jsonl`、`interrupts.jsonl`）。
 
 注意：重启一次大约 6～9 秒（要等 pi-memory 写完退出小结），这期间飞书长连接会短暂断开，恢复后自动重连，没发出去的消息会补发。
+
+## pi-bot-cn-browser.service
+
+常驻的虚拟屏幕（Xvfb :99）+ Chromium，调试端口只监听 127.0.0.1:9223，不对公网开放。用 `scripts/install-browser.sh` 安装；`systemctl status pi-bot-cn-browser` 查看。机器人重启不会关浏览器，登录状态保留。

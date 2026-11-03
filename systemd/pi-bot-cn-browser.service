@@ -1,0 +1,24 @@
+# pi-bot-cn「自己的浏览器」：Xvfb 虚拟屏幕 + Chromium（调试端口只绑 127.0.0.1）。公众号「AI之境」
+# 安装：bash scripts/install-browser.sh
+[Unit]
+Description=pi-bot-cn browser (Xvfb + Chromium, CDP on 127.0.0.1)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/pi-bot-cn
+Environment=HOME=/home/ubuntu
+Environment=TZ=Asia/Shanghai
+Environment=PIBOT_DATA_DIR=/home/ubuntu/pi-bot-cn-data
+ExecStart=/bin/bash /home/ubuntu/pi-bot-cn/scripts/browser.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+# 2核4G：浏览器封顶 1.4G，超了 systemd 会重启它（登录状态在 profile 里，不丢）
+MemoryMax=1400M
+TasksMax=1024
+
+[Install]
+WantedBy=multi-user.target
