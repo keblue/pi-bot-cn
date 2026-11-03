@@ -1,0 +1,6 @@
+{
+  "_comment": "第三方依赖锁版本（不 vendor 进仓库）。install.sh 按这里安装。",
+  "@earendil-works/pi-coding-agent": "1.5.0",
+  "pi-memory": "0.4.2",
+  "@larksuiteoapi/node-sdk": "1.68.0"
+}

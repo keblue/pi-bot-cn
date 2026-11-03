@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart pi-bot-cn after env change
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart pi-bot-cn.service

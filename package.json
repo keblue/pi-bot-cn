@@ -23,5 +23,8 @@
   "scripts": {
     "doctor": "bash doctor.sh",
     "install:bot": "bash install.sh"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.68.0"
   }
 }

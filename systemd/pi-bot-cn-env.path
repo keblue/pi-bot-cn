@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart pi-bot-cn when its env file changes (e.g. 新填 FEISHU_APP_ID)
+
+[Path]
+PathChanged=/home/ubuntu/.config/pi-bot-cn/env
+Unit=pi-bot-cn-env-reload.service
+
+[Install]
+WantedBy=multi-user.target

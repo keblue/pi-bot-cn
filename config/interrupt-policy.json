@@ -1,0 +1,18 @@
+{
+  "_comment": "运行中收到新消息时怎么处理。cancel=清队列+abort+杀进程组；redirect=立即打断当前工具并 steer；followUp=做完再说；其余默认 steer（像真人插话）。正则按顺序匹配。",
+  "cancelMaxLength": 12,
+  "cancelPatterns": ["^(停|停下|停止|停一下|先停|取消|别做了|不做了|不用了|算了|打住|stop|cancel|abort)[!！。.~～ ]*$", "^/(abort|stop)$"],
+  "redirectPatterns": ["^(改成|改为|换成|改一下|换个|先别|别.{0,8}了[，,]|不要.{0,8}了[，,]|不对[，,]|算了[，,])", "^/redirect\\s"],
+  "followUpPatterns": ["^(做完|弄完|完了以后|完了之后|之后再|然后再|等你做完|顺便最后)"],
+  "defaultWhileBusy": "steer",
+  "hardInterruptOnRedirect": true,
+  "redirectWhileThinking": "abort_and_prompt",
+  "showToolProgress": true,
+  "idleTimeoutMinutes": 30,
+  "acks": {
+    "cancel": "好，停了。",
+    "redirect": "收到，马上改。",
+    "followUp": "好，这个做完就接着弄。",
+    "steer": ""
+  }
+}

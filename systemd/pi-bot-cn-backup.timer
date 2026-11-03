@@ -1,0 +1,9 @@
+[Unit]
+Description=pi-bot-cn daily backup at 03:30 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+Persistent=true
+
+[Install]
+WantedBy=timers.target

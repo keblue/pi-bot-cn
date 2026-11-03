@@ -1,0 +1,6 @@
+[Unit]
+Description=pi-bot-cn health check (restart gateway if /health fails)
+
+[Service]
+Type=oneshot
+ExecStart=/home/ubuntu/pi-bot-cn/scripts/healthcheck.sh

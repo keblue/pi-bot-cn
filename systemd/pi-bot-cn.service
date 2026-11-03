@@ -1,0 +1,34 @@
+# pi-bot-cn 常驻网关（公众号「AI之境」）
+# 安装：sudo bash scripts/install-systemd.sh
+[Unit]
+Description=pi-bot-cn duet-gateway (pi RPC sessions + memory + interrupt + outbox)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/pi-bot-cn
+EnvironmentFile=/home/ubuntu/.config/pi-bot-cn/env
+Environment=HOME=/home/ubuntu
+Environment=TZ=Asia/Shanghai
+Environment=PATH=/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PIBOT_DATA_DIR=/home/ubuntu/pi-bot-cn-data
+Environment=PIBOT_LOG_STDOUT=1
+ExecStart=/usr/bin/node /home/ubuntu/pi-bot-cn/gateway/main.mjs
+Restart=always
+RestartSec=2
+# 有序停机：网关先 flush 流式缓冲进 Outbox，再关 pi 子进程（pi-memory 写退出小结）
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# 2核4G：给网关 + 若干 pi 子进程留足但封顶
+MemoryMax=2500M
+TasksMax=512
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

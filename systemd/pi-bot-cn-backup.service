@@ -1,0 +1,8 @@
+[Unit]
+Description=pi-bot-cn daily backup of memory / sessions / outbox
+
+[Service]
+Type=oneshot
+User=ubuntu
+Environment=PIBOT_DATA_DIR=/home/ubuntu/pi-bot-cn-data
+ExecStart=/home/ubuntu/pi-bot-cn/scripts/backup-memory.sh
