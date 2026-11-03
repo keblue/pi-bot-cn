@@ -1,7 +1,7 @@
 {
   "name": "pi-bot-cn",
   "version": "0.0.1",
-  "description": "pi + DeepSeek + 飞书的大陆私人管家技能包；由微信公众号「AI之境」设计与维护",
+  "description": "大陆可自建的 Grok Bot 平替：pi + DeepSeek + 飞书常驻私人助手；由微信公众号「AI之境」设计与维护",
   "license": "MIT",
   "private": false,
   "repository": {

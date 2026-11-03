@@ -6,7 +6,7 @@
 | 依赖 | 计划锁定版本 | 许可证 | 用途 |
 |---|---|---|---|
 | `@earendil-works/pi-coding-agent` | 1.5.0 | MIT | pi 主体，内置 DeepSeek |
-| `@amaster.ai/pi-channels` | 0.1.35 | Apache-2.0 | 飞书长连接参考 / 备选桥（MVP 倾向自写 duet-gateway） |
+| `@amaster.ai/pi-channels` | 0.1.35 | Apache-2.0 | 飞书长连接参考 / 备选桥（MVP 倾向自写飞书网关，对齐 Grok Bot 的频道能力） |
 | `pi-schedule-prompt` | 0.4.1 | MIT | 定时与一次性任务 |
 | `pi-memory` | 0.4.2 | MIT | MEMORY.md + 每日日志 |
 | `pi-subagents` | 0.84.0 | MIT | 子任务拆分 |
